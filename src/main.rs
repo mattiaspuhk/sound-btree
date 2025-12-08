@@ -1,6 +1,6 @@
-mod node;
-use node::Node;
+use sound_btree::Node;
 
 fn main() {
-    let mut node: Node<i32, String, 5> = Node::new_leaf();
+    let node = Node::new(true);
+    println!("Node created! Length: {}", node.len);
 }
