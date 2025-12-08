@@ -1,3 +1,5 @@
+use std::mem;
+
 const B: usize = 6;
 const CAPACITY: usize = 2 * B - 1;
 
@@ -27,25 +29,48 @@ impl Node {
     }
 
     pub fn insert_non_full(&mut self, key: u64, value: u64) {
-        match self.search_node(key) {
-            Ok(index) => {
-                self.keys[index] = key;
+        let mut idx = match self.search_node(key) {
+            Ok(idx) => {
+                self.values[idx] = value;
+                return;
+            },
+            Err(idx) => idx,
+        };
+
+        if self.is_leaf {
+            if self.len == CAPACITY {
+                panic!("Node is full");
             }
-            Err(index) => {
-                if self.len == CAPACITY {
-                    panic!("Node is full");
+
+            for i in (idx..self.len).rev() {
+                self.keys[i + 1] = self.keys[i];
+                self.values[i + 1] = self.values[i];
+            }
+
+            self.keys[idx] = key;
+            self.values[idx] = value;
+            self.len += 1;
+        } else {
+            if self.children[idx].as_ref().unwrap().len == CAPACITY {
+                let (mid_key, mid_val, right_child) = self.children[idx].as_mut().unwrap().split();
+
+                for i in (idx..self.len).rev() {
+                    self.keys[i+1] = self.keys[i];
+                    self.values[i+1] = self.values[i];
+                    self.children[i+2] = self.children[i+1].take();
                 }
 
-                for i in (index..self.len).rev() {
-                    self.keys[i + 1] = self.keys[i];
-                    self.values[i + 1] = self.values[i];
-                }
-
-                self.keys[index] = key;
-                self.values[index] = value;
-
+                self.keys[idx] = mid_key;
+                self.values[idx] = mid_val;
+                self.children[idx+1] = Some(Box::new(right_child));
                 self.len += 1;
+
+                if key > mid_key {
+                    idx += 1;
+                }
             }
+
+            self.children[idx].as_mut().unwrap().insert_non_full(key, value);
         }
     }
 
@@ -74,5 +99,54 @@ impl Node {
         let median_value = self.values[mid];
 
         (median_key, median_value, right)
+    }
+}
+
+pub struct BTree {
+    root: Node,
+}
+
+impl BTree {
+    pub fn new() -> Self {
+        Self {
+            root: Node::new(true),
+        }
+    }
+
+    pub fn insert(&mut self, key: u64, value: u64) {
+        if self.root.len == CAPACITY {
+            let new_root = Node::new(false);
+
+            let old_root = mem::replace(&mut self.root, new_root);
+            self.root.children[0] = Some(Box::new(old_root));
+        }
+
+        self.root.insert_non_full(key, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_root_split() {
+        let mut tree = BTree::new();
+
+        for i in 1..=11 {
+            tree.insert(i * 10, i * 100);
+        }
+
+        assert_eq!(tree.root.len, 11);
+        assert!(tree.root.is_leaf);
+
+        tree.insert(120, 1200);
+
+        assert_eq!(tree.root.is_leaf, false);
+        assert_eq!(tree.root.len, 1);
+        assert!(tree.root.children[0].is_some());
+        assert!(tree.root.children[1].is_some());
+
+        println!("Root split successful!");
     }
 }
