@@ -25,4 +25,27 @@ impl Node {
         let valid_keys = &self.keys[0..self.len];
         valid_keys.binary_search(&key)
     }
+
+    pub fn insert_non_full(&mut self, key: u64, value: u64) {
+        match self.search_node(key) {
+            Ok(index) => {
+                self.keys[index] = key;
+            }
+            Err(index) => {
+                if self.len == CAPACITY {
+                    panic!("Node is full");
+                }
+
+                for i in (index..self.len).rev() {
+                    self.keys[i + 1] = self.keys[i];
+                    self.values[i + 1] = self.values[i];
+                }
+
+                self.keys[index] = key;
+                self.values[index] = value;
+
+                self.len += 1;
+            }
+        }
+    }
 }
