@@ -48,4 +48,31 @@ impl Node {
             }
         }
     }
+
+    pub fn split(&mut self) -> (u64, u64, Node) {
+        let mid = self.len / 2;
+
+        let mut right = Node::new(self.is_leaf);
+
+        let count = self.len - 1 - mid;
+
+        for i in 0..count {
+            right.keys[i] = self.keys[mid + i + 1];
+            right.values[i] = self.values[mid + i + 1];
+        }
+
+        if !self.is_leaf {
+            for i in 0..=count {
+                right.children[i] = self.children[mid + i + 1].take();
+            }
+        }
+
+        self.len = mid;
+        right.len = count;
+
+        let median_key = self.keys[mid];
+        let median_value = self.values[mid];
+
+        (median_key, median_value, right)
+    }
 }
