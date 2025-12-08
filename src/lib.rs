@@ -20,4 +20,9 @@ impl Node {
             children: std::array::from_fn(|_| None),
         }
     }
+
+    pub fn search_node(&self, key: u64) -> Result<usize, usize> {
+        let valid_keys = &self.keys[0..self.len];
+        valid_keys.binary_search(&key)
+    }
 }
