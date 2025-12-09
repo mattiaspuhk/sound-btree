@@ -8,7 +8,7 @@ pub struct NodeId(u32);
 
 #[derive(Debug)]
 pub struct Node {
-    pub version: AtomicU64,
+    pub version: AtomicU64, // TODO: For lock coupling
     pub keys: [u64; CAPACITY],
     pub values: [u64; CAPACITY],
     pub children: [Option<NodeId>; CAPACITY + 1],
@@ -252,56 +252,39 @@ mod tests {
     fn test_root_split() {
         let mut tree = BTree::new();
 
-        // 1. Fill the first node (Capacity is 11)
         for i in 1..=11 {
             tree.insert(i * 10, i * 100);
         }
 
-        // Verify: We should have 1 page (the root) and it should be full
         assert_eq!(tree.pages.len(), 1);
         assert_eq!(tree.pages[0].len, 11);
 
-        // 2. Insert one more to trigger split
         tree.insert(120, 1200);
-
-        // 3. Check the Arena Structure
-        // We expect 3 nodes now:
-        // - Page 0 (Old Root, now Left Child)
-        // - Page 1 (New Right Child)
-        // - Page 2 (New Root) -> Note: The order depends on your implementation,
-        //   but usually new_node appends to the end.
 
         assert!(tree.pages.len() >= 3);
 
         let root = &tree.pages[tree.root_id.0 as usize];
         assert_eq!(root.is_leaf, false);
-        assert_eq!(root.len, 1); // Should hold the median key (60)
+        assert_eq!(root.len, 1);
 
-        // Validate children exist
         let left_child_id = root.children[0].expect("Left child missing");
         let right_child_id = root.children[1].expect("Right child missing");
 
-        // Ensure they point to valid pages
         assert!(left_child_id.0 < tree.pages.len() as u32);
         assert!(right_child_id.0 < tree.pages.len() as u32);
     }
 
     #[test]
     fn test_large_volume() {
-        // Insert 1000 items to force multiple levels of splits
         let mut tree = BTree::new();
         for i in 0..1000 {
             tree.insert(i, i * 10);
         }
 
-        // Verify all exist
         for i in 0..1000 {
             assert_eq!(tree.search(i), Some(i * 10));
         }
 
-        // Verify we aren't leaking memory or creating too many nodes
-        // 1000 items / ~8 items per node = approx 125 nodes.
-        // It shouldn't be massive.
         println!("Total nodes allocated: {}", tree.pages.len());
         assert!(tree.pages.len() < 200);
     }
