@@ -92,7 +92,7 @@ impl BTree {
         }
     }
 
-    fn new_node(&mut self, is_leaf: bool) -> NodeId {
+    fn new_node(&self, is_leaf: bool) -> NodeId {
         let idx = self.next_free_idx.fetch_add(1, Ordering::Relaxed);
 
         if idx >= 100_000 {
@@ -122,16 +122,21 @@ impl BTree {
 
                 let start_version = node.read_version();
 
-                let (found, child_id) = unsafe {
+                let read_result = unsafe {
                     let len = *node.len.get();
                     let keys = &*node.keys.get();
+
                     match keys[0..len].binary_search(&key) {
-                        Ok(idx) => (Some((*node.values.get())[idx]), None),
+                        Ok(idx) => {
+                            let values = &*node.values.get();
+                            Ok(Some(values[idx]))
+                        }
                         Err(idx) => {
                             if node.is_leaf {
-                                (None, None)
+                                Ok(None)
                             } else {
-                                (None, (*node.children.get())[idx])
+                                let children = &*node.children.get();
+                                Err(children[idx])
                             }
                         }
                     }
@@ -141,149 +146,268 @@ impl BTree {
                     continue 'restart;
                 }
 
-                if let Some(val) = found {
-                    return Some(val);
-                }
-                match child_id {
-                    Some(id) => current_id = id,
-                    None => return None,
+                match read_result {
+                    Ok(result) => return result,
+                    Err(child_opt) => {
+                        match child_opt {
+                            Some(child_id) => current_id = child_id,
+                            None => continue 'restart,
+                        }
+                    }
                 }
             }
         }
     }
 
-    pub fn insert(&mut self, key: u64, value: u64) {
-        if self.pages[self.root_id.0 as usize].len == CAPACITY {
-            let new_root_id = self.new_node(false);
-            let old_root_id = self.root_id;
+    pub fn insert(self, key: u64, value: u64) {
+        if let Some(success) = self.insert_optimistic(key, value) {
+            if success { return; }
+        }
 
-            self.pages[new_root_id.0 as usize].children[0] = Some(old_root_id);
-            self.root_id = new_root_id;
+        self.insert_pessimistic(key, value);
+    }
+
+    fn insert_optimistic(&self, key: u64, value: u64) -> Option<bool> {
+        let mut current_id = self.root_id;
+
+        loop {
+            let node = self.node(current_id);
+            let start_version = node.read_version();
+
+            let next_step = unsafe {
+                let len = *node.len.get();
+                let keys = &*node.keys.get();
+
+                if node.is_leaf {
+                    Err(())
+                } else {
+                    let idx = match keys[0..len].binary_search(&key) {
+                        Ok(i) => i + 1,
+                        Err(i) => i,
+                    };
+                    Ok((*node.children.get())[idx].unwrap())
+                }
+            };
+
+            if !node.validate(start_version) {
+                return Some(false);
+            }
+
+            match next_step {
+                Ok(child_id) => current_id = child_id,
+                Err(_) => {
+                    node.write_lock();
+
+                    let is_full = unsafe { *node.len.get() <= CAPACITY };
+
+                    if is_full {
+                        node.write_unlock();
+                        return None;
+                    }
+
+                    unsafe {
+                        let len = *node.len.get();
+                        let keys = &mut *node.keys.get();
+                        let vals = &mut *node.values.get();
+
+                        match keys[0..len].binary_search(&key) {
+                            Ok(idx) => vals[idx] = value,
+                            Err(idx) => {
+                                keys.copy_within(idx..len, idx + 1);
+                                vals.copy_within(idx..len, idx + 1);
+                                keys[idx] = key;
+                                vals[idx] = value;
+                                *node.len.get() += 1;
+                            }
+                        }
+                    }
+
+                    node.write_unlock();
+                    return Some(true);
+                }
+            }
+        }
+    }
+
+    fn insert_pessimistic(&self, key: u64, value: u64) {
+        let root = self.node(self.root_id);
+
+        root.write_lock();
+        let root_full = unsafe { *root.len.get() == CAPACITY };
+
+        if root_full {
+            let new_root_id = self.new_node(false);
+            let new_root = self.node(new_root_id);
+
+            unsafe {
+                (*new_root.children.get())[0] = Some(self.root_id);
+            }
 
             self.split_child(new_root_id, 0);
         }
 
-        self.insert_non_full(self.root_id, key, value);
+        root.write_unlock();
+
+        self.insert_pessimistic_non_full(self.root_id, key, value);
     }
 
-    fn split_child(&mut self, parent_id: NodeId, child_idx: usize) {
-        let child_id =
-            self.pages[parent_id.0 as usize].children[child_idx].expect("Child must exist");
+    fn insert_pessimistic_non_full(&self, node_id: NodeId, key: u64, value: u64) {
+        let node = self.node(node_id);
 
-        let (median_key, median_val, right_id) = self.allocate_and_distribute(child_id);
-        let parent = &mut self.pages[parent_id.0 as usize];
-
-        parent
-            .keys
-            .copy_within(child_idx..parent.len, child_idx + 1);
-        parent
-            .values
-            .copy_within(child_idx..parent.len, child_idx + 1);
-        parent
-            .children
-            .copy_within(child_idx + 1..parent.len + 1, child_idx + 2);
-
-        parent.keys[child_idx] = median_key;
-        parent.values[child_idx] = median_val;
-        parent.children[child_idx + 1] = Some(right_id);
-        parent.len += 1;
-    }
-
-    fn allocate_and_distribute(&mut self, left_id: NodeId) -> (u64, u64, NodeId) {
-        let is_leaf = self.pages[left_id.0 as usize].is_leaf;
-        let right_id = self.new_node(is_leaf);
-
-        let (left, right) = self.get_mut_pair(left_id, right_id);
-
-        let mid = left.len / 2;
-        let count = left.len - 1 - mid;
-
-        right.keys[0..count].copy_from_slice(&left.keys[mid + 1..mid + 1 + count]);
-        right.values[0..count].copy_from_slice(&left.values[mid + 1..mid + 1 + count]);
-
-        if !left.is_leaf {
-            right.children[0..=count].copy_from_slice(&left.children[mid + 1..mid + 2 + count]);
-            left.children[mid + 1..mid + 2 + count].fill(None);
-        }
-
-        let median_key = left.keys[mid];
-        let median_val = left.values[mid];
-
-        left.len = mid;
-        right.len = count;
-
-        (median_key, median_val, right_id)
-    }
-
-    fn insert_non_full(&mut self, node_id: NodeId, key: u64, value: u64) {
-        let is_leaf = self.pages[node_id.0 as usize].is_leaf;
+        node.write_lock();
+        let is_leaf = node.is_leaf;
 
         if is_leaf {
-            let node = &mut self.pages[node_id.0 as usize];
-            match node.search_key(key) {
-                Ok(idx) => {
-                    node.values[idx] = value;
-                }
-                Err(idx) => {
-                    node.keys.copy_within(idx..node.len, idx + 1);
-                    node.values.copy_within(idx..node.len, idx + 1);
+            unsafe {
+                let len = *node.len.get();
+                let keys = &mut *node.keys.get();
+                let vals = &mut *node.values.get();
 
-                    node.keys[idx] = key;
-                    node.values[idx] = value;
-                    node.len += 1;
+                match keys[0..len].binary_search(&key) {
+                    Ok(idx) => vals[idx] = value,
+                    Err(idx) => {
+                        keys.copy_within(idx..len, idx + 1);
+                        vals.copy_within(idx..len, idx + 1);
+                        keys[idx] = key;
+                        vals[idx] = value;
+                        *node.len.get() += 1;
+                    }
                 }
             }
+            node.write_unlock();
         } else {
-            let (child_idx, must_split) = {
-                let node = &self.pages[node_id.0 as usize];
-                let idx = match node.search_key(key) {
+            unsafe {
+                let len = *node.len.get();
+                let keys = &*node.keys.get();
+                let idx = match keys[0..len].binary_search(&key) {
                     Ok(i) => i + 1,
                     Err(i) => i,
                 };
-                let child_id = node.children[idx].expect("Internal node structure broken");
-                (idx, self.pages[child_id.0 as usize].len == CAPACITY)
-            };
 
-            if must_split {
-                self.split_child(node_id, child_idx);
+                let children = &*node.children.get();
+                let child_id = children[idx].expect("Structure broken");
 
-                let node = &self.pages[node_id.0 as usize];
-                let current_key_at_split = node.keys[child_idx];
+                let child = self.node(child_id);
+                child.write_lock();
+                let child_full = *child.len.get() == CAPACITY;
+                child.write_unlock();
 
-                if key > current_key_at_split {
-                    let next_child = node.children[child_idx + 1].unwrap();
-                    self.insert_non_full(next_child, key, value);
+                if child_full {
+                    self.split_child(node_id, idx);
+
+                    let go_right = unsafe {
+                        let keys = &*node.keys.get();
+                        key > keys[idx]
+                    };
+
+                    if go_right {
+                        let right_id = unsafe { (*node.children.get())[idx+1].unwrap() };
+                        node.write_unlock();
+                        self.insert_pessimistic_non_full(right_id, key, value);
+                    } else {
+                        node.write_unlock();
+                        self.insert_pessimistic_non_full(child_id, key, value);
+                    }
                 } else {
-                    let next_child = node.children[child_idx].unwrap();
-                    self.insert_non_full(next_child, key, value);
+                    node.write_unlock();
+                    self.insert_pessimistic_non_full(child_id, key, value);
                 }
-            } else {
-                let next_child = self.pages[node_id.0 as usize].children[child_idx].unwrap();
-                self.insert_non_full(next_child, key, value);
             }
         }
     }
 
+    fn split_child(&self, parent_id: NodeId, child_idx: usize) {
+        let parent = self.node(parent_id);
+
+        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
+        let child = self.node(child_id);
+
+        child.write_lock();
+
+        let (mid_key, mid_val, right_id) = self.allocate_and_distribute(child_id);
+
+        unsafe {
+            let p_len = *parent.len.get();
+            let keys = &mut *parent.keys.get();
+            let vals = &mut *parent.values.get();
+            let children = &mut *parent.children.get();
+
+            keys.copy_within(child_idx..p_len, child_idx + 1);
+            vals.copy_within(child_idx..p_len, child_idx + 1);
+            children.copy_within(child_idx + 1..p_len + 1, child_idx + 2);
+
+            keys[child_idx] = mid_key;
+            vals[child_idx] = mid_val;
+            children[child_idx + 1] = Some(right_id);
+            *parent.len.get() += 1;
+        }
+
+        child.write_unlock();
+    }
+
+    fn allocate_and_distribute(&self, left_id: NodeId) -> (u64, u64, NodeId) {
+        // Left is ALREADY locked
+        let left = self.node(left_id);
+        let is_leaf = left.is_leaf;
+
+        let right_id = self.new_node(is_leaf);
+        let right = self.node(right_id);
+
+        let (mid_key, mid_val) = unsafe {
+            let left_len = *left.len.get();
+            let mid = left_len / 2;
+            let count = left_len - 1 - mid;
+
+            let l_keys = &mut *left.keys.get();
+            let l_vals = &mut *left.values.get();
+            let l_children = &mut *left.children.get();
+
+            let r_keys = &mut *right.keys.get();
+            let r_vals = &mut *right.values.get();
+            let r_children = &mut *right.children.get();
+
+            // Copy data to Right
+            r_keys[0..count].copy_from_slice(&l_keys[mid + 1..mid + 1 + count]);
+            r_vals[0..count].copy_from_slice(&l_vals[mid + 1..mid + 1 + count]);
+
+            if !is_leaf {
+                r_children[0..=count].copy_from_slice(&l_children[mid + 1..mid + 2 + count]);
+            }
+
+            let mk = l_keys[mid];
+            let mv = l_vals[mid];
+
+            *left.len.get() = mid;
+            *right.len.get() = count;
+
+            (mk, mv)
+        };
+
+        (mid_key, mid_val, right_id)
+    }
+
     pub fn print(&self) {
-        println!("=== B-Tree Structure (Arena) ===");
+        println!("=== B-Tree Structure (Arena + OLC) ===");
         self.print_subtree(self.root_id, 0);
-        println!("================================");
+        println!("======================================");
     }
 
     fn print_subtree(&self, node_id: NodeId, depth: usize) {
-        let node = &self.pages[node_id.0 as usize];
+        let node = self.node(node_id);
         let indent = "  ".repeat(depth);
-        println!(
-            "{}Node[{}] (Leaf: {}) Keys: {:?}",
-            indent,
-            node_id.0,
-            node.is_leaf,
-            &node.keys[0..node.len]
-        );
-        if !node.is_leaf {
-            for i in 0..=node.len {
-                if let Some(child_id) = node.children[i] {
-                    self.print_subtree(child_id, depth + 1);
+        unsafe {
+            println!(
+                "{}Node[{}] (Leaf: {}) Keys: {:?}",
+                indent,
+                node_id.0,
+                node.is_leaf,
+                &(*node.keys.get())[0..*node.len.get()]
+            );
+            if !node.is_leaf {
+                for i in 0..=*node.len.get() {
+                    if let Some(child_id) = (*node.children.get())[i] {
+                        self.print_subtree(child_id, depth + 1);
+                    }
                 }
             }
         }
@@ -296,23 +420,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_basic_ops() {
-        let mut tree = BTree::new();
+    fn test_thread_safe_insert_search() {
+        let tree = BTree::new(); // Immutable binding, but internal mutability via UnsafeCell
+
         tree.insert(10, 100);
         tree.insert(20, 200);
+        tree.insert(5, 50);
+
         assert_eq!(tree.search(10), Some(100));
+        assert_eq!(tree.search(5), Some(50));
         assert_eq!(tree.search(20), Some(200));
+        assert_eq!(tree.search(999), None);
     }
 
     #[test]
-    fn test_splits() {
-        let mut tree = BTree::new();
+    fn test_splitting_logic() {
+        let tree = BTree::new();
         for i in 0..20 {
             tree.insert(i, i * 10);
         }
         for i in 0..20 {
             assert_eq!(tree.search(i), Some(i * 10));
         }
-        assert!(tree.pages.len() > 1);
     }
 }

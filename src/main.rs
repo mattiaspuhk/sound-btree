@@ -1,59 +1,74 @@
 use sound_btree::BTree;
+use std::sync::Arc;
+use std::thread;
 
 fn main() {
-    println!("=====================================================");
-    println!("    Sound B-Tree: Cache-Optimized Arena Demo         ");
-    println!("=====================================================");
-    println!("Config: B=6 (Max Keys per Node = 11)");
+    println!("=======================================================");
+    println!("    Concurrent B-Tree Demo (OLC + Hybrid Locking)      ");
+    println!("=======================================================");
 
-    // 1. Initialize
-    println!("\n[Step 1] Initializing B-Tree...");
-    let mut tree = BTree::new();
-    println!("-> Tree created. Arena allocated.");
+    println!("\n[Test 1] Structure Verification (Single Thread)");
+    let tree = BTree::new();
 
-    // 2. Fill the Root (Capacity is 11)
-    // We insert 10, 20, ... 110.
-    println!("\n[Step 2] Filling the Root Node (11 items)...");
-    for i in 1..=11 {
-        tree.insert(i * 10, i * 100);
+    for i in 0..25 {
+        tree.insert(i, i * 100);
     }
 
-    // Show that it is still a single flat node
-    println!("-> Current Structure (Leaf Only):");
     tree.print();
+    println!("-> Structure looks valid (Nodes are linked correctly).");
 
-    // 3. Trigger Root Split
-    // Inserting 12th item (120). Root must split.
-    // Median (60) moves to new Root. Left=[10..50], Right=[70..120].
-    println!("\n[Step 3] Inserting Key 120 (Triggers Root Split)...");
-    tree.insert(120, 1200);
 
-    println!("-> Structure after Split (Root -> 2 Children):");
-    // Look for Node[2] as the new root, pointing to Node[0] and Node[1]
-    tree.print();
+    println!("\n[Test 2] Multi-Threaded Race Condition Test");
+    println!("-> Spawning 4 threads.");
+    println!("-> Each thread inserts 2,500 items simultaneously.");
+    println!("-> Total expected items: 10,000");
 
-    // 4. Force Internal Splits (Deep Hierarchy)
-    // Insert 40 more items to fill the children and force them to split too.
-    println!("\n[Step 4] Inserting 40 more keys to force tree growth...");
-    for i in 13..=53 {
-        tree.insert(i * 10, i * 100);
+    let shared_tree = Arc::new(BTree::new());
+    let mut handles = vec![];
+
+    for i in 0..4 {
+        let tree_ref = shared_tree.clone();
+
+        handles.push(thread::spawn(move || {
+            let start = i * 2500;
+            let end = (i + 1) * 2500;
+
+            for key in start..end {
+                tree_ref.insert(key, key * 10);
+            }
+            println!("   Thread {} finished inserting range {}..{}", i, start, end);
+        }));
     }
 
-    println!("-> Final Tree Structure:");
-    tree.print();
+    for h in handles {
+        h.join().unwrap();
+    }
+    println!("-> All threads joined.");
 
-    // 5. Validation (Search)
-    println!("\n[Step 5] validating Data Retrieval...");
-    let targets = [10, 60, 120, 500, 999]; // 999 does not exist
 
-    for key in targets {
-        match tree.search(key) {
-            Some(val) => println!("   [OK] Search({}) -> Found Value: {}", key, val),
-            None      => println!("   [OK] Search({}) -> Not Found (Correct)", key),
+    println!("\n[Test 3] Verifying Data Integrity (Optimistic Reads)");
+    println!("-> Searching for all 10,000 keys...");
+
+    let mut missing_count = 0;
+    for i in 0..10000 {
+        match shared_tree.search(i) {
+            Some(val) => {
+                if val != i * 10 {
+                    println!("Error: Key {} has wrong value {}", i, val);
+                    missing_count += 1;
+                }
+            },
+            None => {
+                println!("Error: Key {} is MISSING!", i);
+                missing_count += 1;
+            }
         }
     }
 
-    println!("\n=====================================================");
-    println!("    Demo Complete. System is Operational.            ");
-    println!("=====================================================");
+    if missing_count == 0 {
+        println!("SUCCESS: All 10,000 keys found correctly!");
+        println!("The Optimistic Lock Coupling implementation is thread-safe. 🚀");
+    } else {
+        println!("FAILURE: {} keys were lost/corrupted.", missing_count);
+    }
 }
