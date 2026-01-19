@@ -113,15 +113,42 @@ impl BTree {
         NodeId(idx as u32)
     }
 
-    fn get_mut_pair(&mut self, idx1: NodeId, idx2: NodeId) -> (&mut Node, &mut Node) {
-        let i1 = idx1.0 as usize;
-        let i2 = idx2.0 as usize;
-        if i1 < i2 {
-            let (left_slice, right_slice) = self.pages.as_mut_slice().split_at_mut(i2);
-            (&mut left_slice[i1], &mut right_slice[0])
-        } else {
-            let (left_slice, right_slice) = self.pages.as_mut_slice().split_at_mut(i1);
-            (&mut right_slice[0], &mut left_slice[i2])
+    pub fn search(&self, key: u64) -> Option<u64> {
+        'restart: loop {
+            let mut current_id = self.root_id;
+
+            loop {
+                let node = self.node(current_id);
+
+                let start_version = node.read_version();
+
+                let (found, child_id) = unsafe {
+                    let len = *node.len.get();
+                    let keys = &*node.keys.get();
+                    match keys[0..len].binary_search(&key) {
+                        Ok(idx) => (Some((*node.values.get())[idx]), None),
+                        Err(idx) => {
+                            if node.is_leaf {
+                                (None, None)
+                            } else {
+                                (None, (*node.children.get())[idx])
+                            }
+                        }
+                    }
+                };
+
+                if !node.validate(start_version) {
+                    continue 'restart;
+                }
+
+                if let Some(val) = found {
+                    return Some(val);
+                }
+                match child_id {
+                    Some(id) => current_id = id,
+                    None => return None,
+                }
+            }
         }
     }
 
@@ -233,22 +260,6 @@ impl BTree {
             } else {
                 let next_child = self.pages[node_id.0 as usize].children[child_idx].unwrap();
                 self.insert_non_full(next_child, key, value);
-            }
-        }
-    }
-
-    pub fn search(&self, key: u64) -> Option<u64> {
-        let mut current_id = self.root_id;
-        loop {
-            let node = &self.pages[current_id.0 as usize];
-            match node.search_key(key) {
-                Ok(idx) => return Some(node.values[idx]),
-                Err(idx) => {
-                    if node.is_leaf {
-                        return None;
-                    }
-                    current_id = node.children[idx]?;
-                }
             }
         }
     }
