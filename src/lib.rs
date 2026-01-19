@@ -1,3 +1,7 @@
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::marker::Sync;
+
 const B: usize = 6;
 const CAPACITY: usize = 2 * B - 1;
 
@@ -6,48 +10,94 @@ pub struct NodeId(u32);
 
 #[derive(Debug)]
 pub struct Node {
-    pub keys: [u64; CAPACITY],
-    pub values: [u64; CAPACITY],
-    pub children: [Option<NodeId>; CAPACITY + 1],
-    pub len: usize,
+    pub version: AtomicU64,
+
+    pub keys: UnsafeCell<[u64; CAPACITY]>,
+    pub values: UnsafeCell<[u64; CAPACITY]>,
+    pub children: UnsafeCell<[Option<NodeId>; CAPACITY + 1]>,
+    pub len: UnsafeCell<usize>,
     pub is_leaf: bool,
 }
+
+unsafe impl Sync for Node {}
 
 impl Node {
     pub fn new(is_leaf: bool) -> Self {
         Self {
-            len: 0,
+            version: AtomicU64::new(0),
+            len: UnsafeCell::new(0),
             is_leaf,
-            keys: [0; CAPACITY],
-            values: [0; CAPACITY],
-            children: [None; CAPACITY + 1],
+            keys: UnsafeCell::new([0; CAPACITY]),
+            values: UnsafeCell::new([0; CAPACITY]),
+            children: UnsafeCell::new([None; CAPACITY + 1]),
         }
     }
 
-    pub fn search_key(&self, key: u64) -> Result<usize, usize> {
-        self.keys[0..self.len].binary_search(&key)
+    pub fn read_version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    pub fn validate(&self, start_version: u64) -> bool {
+        let current = self.version.load(Ordering::Acquire);
+        current == start_version && (current % 2 == 0)
+    }
+
+    pub fn write_lock(&self) {
+        let mut backoff = 0;
+        loop {
+            let v = self.version.load(Ordering::Relaxed);
+            if v % 2 == 0 {
+                if self.version.compare_exchange_weak(v, v + 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                    return;
+                }
+            }
+            for _ in 0..(1 << backoff) { std::hint::spin_loop(); }
+            if backoff < 6 { backoff += 1; }
+        }
+    }
+
+    pub fn write_unlock(&self) {
+        self.version.fetch_add(1, Ordering::Release);
     }
 }
 
 pub struct BTree {
-    pages: Vec<Node>,
+    pages: UnsafeCell<Vec<Node>>,
+    next_free_idx: AtomicUsize,
     root_id: NodeId,
 }
 
+unsafe impl Sync for BTree {}
+unsafe impl Send for BTree {}
+
 impl BTree {
     pub fn new() -> Self {
+        let max_nodes = 100_000;
         let mut pages = Vec::with_capacity(1024);
         pages.push(Node::new(true));
+        for _ in 0..(max_nodes - 1) {
+            pages.push(Node::new(true));
+        }
         BTree {
-            pages,
+            pages: UnsafeCell::new(pages),
+            next_free_idx: AtomicUsize::new(1),
             root_id: NodeId(0),
         }
     }
 
     fn new_node(&mut self, is_leaf: bool) -> NodeId {
-        let id = self.pages.len() as u32;
-        self.pages.push(Node::new(is_leaf));
-        NodeId(id)
+        let idx = self.next_free_idx.fetch_add(1, Ordering::Relaxed);
+
+        if idx >= 100_000 {
+            panic!("Arena OOM: Increase max_nodes in BTree::new");
+        }
+
+        let pages_ptr = self.pages.get();
+        unsafe {
+            let node_ref = &mut (*pages_ptr)[idx];
+            *node_ref = Node::new(is_leaf);
+        }
+        NodeId(idx as u32)
     }
 
     fn get_mut_pair(&mut self, idx1: NodeId, idx2: NodeId) -> (&mut Node, &mut Node) {
