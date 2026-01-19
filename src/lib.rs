@@ -85,6 +85,13 @@ impl BTree {
         }
     }
 
+    fn node(&self, id: NodeId) -> &Node {
+        unsafe {
+            let ptr = self.pages.get();
+            &(*ptr)[id.0 as usize]
+        }
+    }
+
     fn new_node(&mut self, is_leaf: bool) -> NodeId {
         let idx = self.next_free_idx.fetch_add(1, Ordering::Relaxed);
 
@@ -92,10 +99,16 @@ impl BTree {
             panic!("Arena OOM: Increase max_nodes in BTree::new");
         }
 
-        let pages_ptr = self.pages.get();
+        let n = self.node(NodeId(idx as u32));
+
         unsafe {
-            let node_ref = &mut (*pages_ptr)[idx];
-            *node_ref = Node::new(is_leaf);
+            *n.keys.get() = [0; CAPACITY];
+            *n.values.get() = [0; CAPACITY];
+            *n.children.get() = [None; CAPACITY + 1];
+            *n.len.get() = 0;
+            let ptr = n as *const Node as *mut Node;
+            (*ptr).is_leaf = is_leaf;
+            (*ptr).version = AtomicU64::new(0);
         }
         NodeId(idx as u32)
     }
