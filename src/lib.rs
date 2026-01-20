@@ -66,6 +66,17 @@ where
         }
     }
 
+    fn new_uninit() -> Self {
+        Self {
+            version: AtomicU64::new(u64::MAX),
+            len: UnsafeCell::new(0),
+            is_leaf: UnsafeCell::new(true),
+            keys: UnsafeCell::new([K::default(); CAPACITY]),
+            values: UnsafeCell::new([V::default(); CAPACITY]),
+            children: UnsafeCell::new([None; CAPACITY + 1]),
+        }
+    }
+
     pub fn read_version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
     }
@@ -102,6 +113,7 @@ where
     pages: UnsafeCell<Vec<Node<K, V>>>,
     next_free_idx: AtomicUsize,
     root_id: AtomicU32,
+    capacity: usize,
 }
 
 /// SAFETY: BTree<K, V> is Sync because:
@@ -138,17 +150,26 @@ where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
+    const DEFAULT_CAPACITY: usize = 10_000;
+
     pub fn new() -> Self {
-        let max_nodes = 100_000;
-        let mut pages = Vec::with_capacity(1024);
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    pub fn with_capacity(max_nodes: usize) -> Self {
+        assert!(max_nodes >= 1, "Arena must have at least 1 node");
+
+        let mut pages = Vec::with_capacity(max_nodes);
         pages.push(Node::new(true));
-        for _ in 0..(max_nodes - 1) {
-            pages.push(Node::new(true));
+        for _ in 1..max_nodes {
+            pages.push(Node::new_uninit());
         }
+
         BTree {
             pages: UnsafeCell::new(pages),
             next_free_idx: AtomicUsize::new(1),
             root_id: AtomicU32::new(0),
+            capacity: max_nodes,
         }
     }
 
@@ -163,8 +184,8 @@ where
     fn new_node(&self, is_leaf: bool) -> NodeId {
         let idx = self.next_free_idx.fetch_add(1, Ordering::Relaxed);
 
-        if idx >= 100_000 {
-            panic!("Arena OOM: Increase max_nodes in BTree::new");
+        if idx >= self.capacity {
+            panic!("Arena OOM: Tree exceeded capacity of {} nodes. Use BTree::with_capacity() for larger trees.", self.capacity);
         }
 
         let n = self.node(NodeId(idx as u32));
