@@ -16,7 +16,7 @@ pub struct Node {
     pub values: UnsafeCell<[u64; CAPACITY]>,
     pub children: UnsafeCell<[Option<NodeId>; CAPACITY + 1]>,
     pub len: UnsafeCell<usize>,
-    pub is_leaf: bool,
+    pub is_leaf: UnsafeCell<bool>,
 }
 
 unsafe impl Sync for Node {}
@@ -26,7 +26,7 @@ impl Node {
         Self {
             version: AtomicU64::new(0),
             len: UnsafeCell::new(0),
-            is_leaf,
+            is_leaf: UnsafeCell::new(is_leaf),
             keys: UnsafeCell::new([0; CAPACITY]),
             values: UnsafeCell::new([0; CAPACITY]),
             children: UnsafeCell::new([None; CAPACITY + 1]),
@@ -107,9 +107,8 @@ impl BTree {
             *n.values.get() = [0; CAPACITY];
             *n.children.get() = [None; CAPACITY + 1];
             *n.len.get() = 0;
-            let ptr = n as *const Node as *mut Node;
-            (*ptr).is_leaf = is_leaf;
-            (*ptr).version.store(0, Ordering::Release);
+            *n.is_leaf.get() = is_leaf;
+            n.version.store(0, Ordering::Release);
         }
         NodeId(idx as u32)
     }
@@ -133,7 +132,7 @@ impl BTree {
                             Ok(Some(values[idx]))
                         }
                         Err(idx) => {
-                            if node.is_leaf {
+                            if *node.is_leaf.get() {
                                 Ok(None)
                             } else {
                                 let children = &*node.children.get();
@@ -179,7 +178,7 @@ impl BTree {
                 let len = *node.len.get();
                 let keys = &*node.keys.get();
 
-                if node.is_leaf {
+                if *node.is_leaf.get() {
                     Err(())
                 } else {
                     let idx = match keys[0..len].binary_search(&key) {
@@ -270,7 +269,7 @@ impl BTree {
         let node = self.node(node_id);
 
         node.write_lock();
-        let is_leaf = node.is_leaf;
+        let is_leaf = unsafe { *node.is_leaf.get() };
 
         if is_leaf {
             unsafe {
@@ -359,7 +358,7 @@ impl BTree {
 
     fn allocate_and_distribute(&self, left_id: NodeId) -> (u64, u64, NodeId) {
         let left = self.node(left_id);
-        let is_leaf = left.is_leaf;
+        let is_leaf = unsafe { *left.is_leaf.get() };
 
         let right_id = self.new_node(is_leaf);
         let right = self.node(right_id);
@@ -408,14 +407,15 @@ impl BTree {
         unsafe {
             let keys_slice = &*node.keys.get();
             let len = *node.len.get();
+            let is_leaf = *node.is_leaf.get();
             println!(
                 "{}Node[{}] (Leaf: {}) Keys: {:?}",
                 indent,
                 node_id.0,
-                node.is_leaf,
+                is_leaf,
                 &keys_slice[0..len]
             );
-            if !node.is_leaf {
+            if !is_leaf {
                 for i in 0..=*node.len.get() {
                     if let Some(child_id) = (*node.children.get())[i] {
                         self.print_subtree(child_id, depth + 1);
