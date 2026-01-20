@@ -187,6 +187,41 @@ where
         self.search(key).is_some()
     }
 
+    pub fn clear(&self) {
+        let root_id = loop {
+            let root_id = NodeId(self.root_id.load(Ordering::Acquire));
+            let root = self.node(root_id);
+            root.write_lock();
+            let current_root = NodeId(self.root_id.load(Ordering::Acquire));
+            if current_root == root_id {
+                break root_id;
+            }
+            root.write_unlock();
+        };
+
+        let node0 = self.node(NodeId(0));
+        if root_id.0 != 0 {
+            node0.write_lock();
+        }
+
+        unsafe {
+            *node0.keys.get() = [K::default(); CAPACITY];
+            *node0.values.get() = [V::default(); CAPACITY];
+            *node0.children.get() = [None; CAPACITY + 1];
+            *node0.len.get() = 0;
+            *node0.is_leaf.get() = true;
+        }
+
+        self.entry_count.store(0, Ordering::Relaxed);
+        self.next_free_idx.store(1, Ordering::Relaxed);
+        self.root_id.store(0, Ordering::Release);
+
+        if root_id.0 != 0 {
+            node0.write_unlock();
+        }
+        self.node(root_id).write_unlock();
+    }
+
     fn node(&self, id: NodeId) -> &Node<K, V> {
         unsafe {
             let ptr = self.pages.get();
@@ -633,5 +668,27 @@ mod tests {
         assert!(tree.contains_key(10));
         assert!(!tree.contains_key(2));
         assert!(!tree.contains_key(100));
+    }
+
+    #[test]
+    fn test_clear() {
+        let tree = BTree::<u64, u64>::new();
+
+        for i in 0..50u64 {
+            tree.insert(i, i * 10);
+        }
+        assert_eq!(tree.len(), 50);
+        assert!(!tree.is_empty());
+
+        tree.clear();
+
+        assert_eq!(tree.len(), 0);
+        assert!(tree.is_empty());
+        assert!(!tree.contains_key(0));
+        assert!(!tree.contains_key(25));
+
+        tree.insert(100, 1000);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree.search(100), Some(1000));
     }
 }
