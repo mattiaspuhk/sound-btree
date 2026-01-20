@@ -178,6 +178,10 @@ where
     pub fn len(&self) -> usize {
         self.entry_count.load(Ordering::Relaxed)
     }
+    
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     fn node(&self, id: NodeId) -> &Node<K, V> {
         unsafe {
@@ -600,5 +604,14 @@ mod tests {
             tree.insert(i, i * 10);
         }
         assert_eq!(tree.len(), 43);
+    }
+
+    #[test]
+    fn test_is_empty() {
+        let tree = BTree::<u64, u64>::new();
+        assert!(tree.is_empty());
+
+        tree.insert(1, 10);
+        assert!(!tree.is_empty());
     }
 }
