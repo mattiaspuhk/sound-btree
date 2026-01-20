@@ -231,10 +231,17 @@ impl BTree {
     }
 
     fn insert_pessimistic(&self, key: u64, value: u64) {
-        let root_id = NodeId(self.root_id.load(Ordering::Acquire));
+        let root_id = loop {
+            let root_id = NodeId(self.root_id.load(Ordering::Acquire));
+            let root = self.node(root_id);
+            root.write_lock();
+            let current_root = NodeId(self.root_id.load(Ordering::Acquire));
+            if current_root == root_id {
+                break root_id;
+            }
+            root.write_unlock();
+        };
         let root = self.node(root_id);
-
-        root.write_lock();
         let root_full = unsafe { *root.len.get() == CAPACITY };
 
         let current_root_id = if root_full {
