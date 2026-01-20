@@ -183,6 +183,10 @@ where
         self.len() == 0
     }
 
+    pub fn contains_key(&self, key: K) -> bool {
+        self.search(key).is_some()
+    }
+
     fn node(&self, id: NodeId) -> &Node<K, V> {
         unsafe {
             let ptr = self.pages.get();
@@ -613,5 +617,21 @@ mod tests {
 
         tree.insert(1, 10);
         assert!(!tree.is_empty());
+    }
+
+    #[test]
+    fn test_contains_key() {
+        let tree = BTree::<u64, u64>::new();
+        assert!(!tree.contains_key(1));
+
+        tree.insert(1, 10);
+        tree.insert(5, 50);
+        tree.insert(10, 100);
+
+        assert!(tree.contains_key(1));
+        assert!(tree.contains_key(5));
+        assert!(tree.contains_key(10));
+        assert!(!tree.contains_key(2));
+        assert!(!tree.contains_key(100));
     }
 }
