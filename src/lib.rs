@@ -290,39 +290,41 @@ impl BTree {
             }
             node.write_unlock();
         } else {
-            unsafe {
+            let keys_ptr = node.keys.get();
+            let children_ptr = node.children.get();
+
+            let idx = unsafe {
                 let len = *node.len.get();
-                let keys = &*node.keys.get();
-                let idx = match keys[0..len].binary_search(&key) {
+                let keys = &*keys_ptr;
+                match keys[0..len].binary_search(&key) {
                     Ok(i) => i + 1,
                     Err(i) => i,
-                };
+                }
+            };
 
-                let children = &*node.children.get();
-                let child_id = children[idx].expect("Structure broken");
+            let child_id = unsafe { (*children_ptr)[idx].expect("Structure broken") };
 
-                let child = self.node(child_id);
-                child.write_lock();
-                let child_full = *child.len.get() == CAPACITY;
-                child.write_unlock();
+            let child = self.node(child_id);
+            child.write_lock();
+            let child_full = unsafe { *child.len.get() == CAPACITY };
+            child.write_unlock();
 
-                if child_full {
-                    self.split_child(node_id, idx);
+            if child_full {
+                self.split_child(node_id, idx);
 
-                    let go_right = key > keys[idx];
+                let go_right = unsafe { key > (*keys_ptr)[idx] };
 
-                    if go_right {
-                        let right_id = children[idx+1].unwrap();
-                        node.write_unlock();
-                        self.insert_pessimistic_non_full(right_id, key, value);
-                    } else {
-                        node.write_unlock();
-                        self.insert_pessimistic_non_full(child_id, key, value);
-                    }
+                if go_right {
+                    let right_id = unsafe { (*children_ptr)[idx + 1].unwrap() };
+                    node.write_unlock();
+                    self.insert_pessimistic_non_full(right_id, key, value);
                 } else {
                     node.write_unlock();
                     self.insert_pessimistic_non_full(child_id, key, value);
                 }
+            } else {
+                node.write_unlock();
+                self.insert_pessimistic_non_full(child_id, key, value);
             }
         }
     }
