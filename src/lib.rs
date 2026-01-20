@@ -114,6 +114,7 @@ where
     next_free_idx: AtomicUsize,
     root_id: AtomicU32,
     capacity: usize,
+    entry_count: AtomicUsize,
 }
 
 /// SAFETY: BTree<K, V> is Sync because:
@@ -170,7 +171,12 @@ where
             next_free_idx: AtomicUsize::new(1),
             root_id: AtomicU32::new(0),
             capacity: max_nodes,
+            entry_count: AtomicUsize::new(0),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entry_count.load(Ordering::Relaxed)
     }
 
     fn node(&self, id: NodeId) -> &Node<K, V> {
@@ -293,24 +299,31 @@ where
                         return None;
                     }
 
-                    unsafe {
+                    let is_new = unsafe {
                         let len = *node.len.get();
                         let keys = &mut *node.keys.get();
                         let vals = &mut *node.values.get();
 
                         match keys[0..len].binary_search(&key) {
-                            Ok(idx) => vals[idx] = value,
+                            Ok(idx) => {
+                                vals[idx] = value;
+                                false
+                            }
                             Err(idx) => {
                                 keys.copy_within(idx..len, idx + 1);
                                 vals.copy_within(idx..len, idx + 1);
                                 keys[idx] = key;
                                 vals[idx] = value;
                                 *node.len.get() += 1;
+                                true
                             }
                         }
-                    }
+                    };
 
                     node.write_unlock();
+                    if is_new {
+                        self.entry_count.fetch_add(1, Ordering::Relaxed);
+                    }
                     return Some(true);
                 }
             }
@@ -359,23 +372,30 @@ where
         let is_leaf = unsafe { *node.is_leaf.get() };
 
         if is_leaf {
-            unsafe {
+            let is_new = unsafe {
                 let len = *node.len.get();
                 let keys = &mut *node.keys.get();
                 let vals = &mut *node.values.get();
 
                 match keys[0..len].binary_search(&key) {
-                    Ok(idx) => vals[idx] = value,
+                    Ok(idx) => {
+                        vals[idx] = value;
+                        false
+                    }
                     Err(idx) => {
                         keys.copy_within(idx..len, idx + 1);
                         vals.copy_within(idx..len, idx + 1);
                         keys[idx] = key;
                         vals[idx] = value;
                         *node.len.get() += 1;
+                        true
                     }
                 }
-            }
+            };
             node.write_unlock();
+            if is_new {
+                self.entry_count.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             let keys_ptr = node.keys.get();
             let children_ptr = node.children.get();
@@ -559,5 +579,26 @@ mod tests {
         assert_eq!(tree.search(0), Some(0));
         assert_eq!(tree.search(10), Some(-100));
         assert_eq!(tree.search(5), None);
+    }
+
+    #[test]
+    fn test_len() {
+        let tree = BTree::<u64, u64>::new();
+        assert_eq!(tree.len(), 0);
+
+        tree.insert(1, 10);
+        assert_eq!(tree.len(), 1);
+
+        tree.insert(2, 20);
+        tree.insert(3, 30);
+        assert_eq!(tree.len(), 3);
+
+        tree.insert(2, 200);
+        assert_eq!(tree.len(), 3);
+
+        for i in 10..50u64 {
+            tree.insert(i, i * 10);
+        }
+        assert_eq!(tree.len(), 43);
     }
 }
