@@ -8,9 +8,9 @@ fn main() {
     println!("=======================================================");
 
     println!("\n[Test 1] Structure Verification (Single Thread)");
-    let tree = BTree::new();
+    let tree = BTree::<u64, u64>::new();
 
-    for i in 0..25 {
+    for i in 0..25u64 {
         tree.insert(i, i * 100);
     }
 
@@ -23,7 +23,7 @@ fn main() {
     println!("-> Each thread inserts 2,500 items simultaneously.");
     println!("-> Total expected items: 10,000");
 
-    let shared_tree = Arc::new(BTree::new());
+    let shared_tree = Arc::new(BTree::<u64, u64>::new());
     let mut handles = vec![];
 
     for i in 0..4 {
@@ -50,7 +50,7 @@ fn main() {
     println!("-> Searching for all 10,000 keys...");
 
     let mut missing_count = 0;
-    for i in 0..10000 {
+    for i in 0..10000u64 {
         match shared_tree.search(i) {
             Some(val) => {
                 if val != i * 10 {
@@ -67,7 +67,7 @@ fn main() {
 
     if missing_count == 0 {
         println!("SUCCESS: All 10,000 keys found correctly!");
-        println!("The Optimistic Lock Coupling implementation is thread-safe. 🚀");
+        println!("The Optimistic Lock Coupling implementation is thread-safe.");
     } else {
         println!("FAILURE: {} keys were lost/corrupted.", missing_count);
     }

@@ -9,17 +9,21 @@ const CAPACITY: usize = 2 * B - 1;
 pub struct NodeId(u32);
 
 #[derive(Debug)]
-pub struct Node {
+pub struct Node<K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
     pub version: AtomicU64,
 
-    pub keys: UnsafeCell<[u64; CAPACITY]>,
-    pub values: UnsafeCell<[u64; CAPACITY]>,
+    pub keys: UnsafeCell<[K; CAPACITY]>,
+    pub values: UnsafeCell<[V; CAPACITY]>,
     pub children: UnsafeCell<[Option<NodeId>; CAPACITY + 1]>,
     pub len: UnsafeCell<usize>,
     pub is_leaf: UnsafeCell<bool>,
 }
 
-/// SAFETY: Node is Sync because concurrent access is mediated by the seqlock protocol:
+/// SAFETY: Node<K, V> is Sync because concurrent access is mediated by the seqlock protocol:
 ///
 /// 1. **Writers** must hold the write lock (version is odd) before accessing any `UnsafeCell`
 ///    field. The lock is acquired via `write_lock()` and released via `write_unlock()`.
@@ -34,19 +38,30 @@ pub struct Node {
 ///    their `NodeId` is made visible to other threads. The `Release` ordering on
 ///    `version.store(0)` in `new_node` synchronizes with the `Acquire` on version reads.
 ///
+/// 4. **Generic bounds**: K and V are required to be `Copy`, ensuring all data lives inline
+///    in the arrays (no heap pointers that could be invalidated by concurrent access).
+///
 /// These invariants ensure that data races cannot occur: either a reader sees a consistent
 /// snapshot (validation succeeds) or it detects concurrent modification (validation fails
 /// and triggers retry).
-unsafe impl Sync for Node {}
+unsafe impl<K, V> Sync for Node<K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{}
 
-impl Node {
+impl<K, V> Node<K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
     pub fn new(is_leaf: bool) -> Self {
         Self {
             version: AtomicU64::new(0),
             len: UnsafeCell::new(0),
             is_leaf: UnsafeCell::new(is_leaf),
-            keys: UnsafeCell::new([0; CAPACITY]),
-            values: UnsafeCell::new([0; CAPACITY]),
+            keys: UnsafeCell::new([K::default(); CAPACITY]),
+            values: UnsafeCell::new([V::default(); CAPACITY]),
             children: UnsafeCell::new([None; CAPACITY + 1]),
         }
     }
@@ -79,15 +94,19 @@ impl Node {
     }
 }
 
-pub struct BTree {
-    pages: UnsafeCell<Vec<Node>>,
+pub struct BTree<K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    pages: UnsafeCell<Vec<Node<K, V>>>,
     next_free_idx: AtomicUsize,
     root_id: AtomicU32,
 }
 
-/// SAFETY: BTree is Sync because:
+/// SAFETY: BTree<K, V> is Sync because:
 ///
-/// 1. **`pages` (UnsafeCell<Vec<Node>>)**: The Vec itself is never resized after construction
+/// 1. **`pages` (UnsafeCell<Vec<Node<K, V>>>)**: The Vec itself is never resized after construction
 ///    (pre-allocated arena). Individual Node access is synchronized via each Node's seqlock.
 ///
 /// 2. **`next_free_idx` (AtomicUsize)**: Atomic, inherently thread-safe. Used for allocating
@@ -98,15 +117,27 @@ pub struct BTree {
 ///
 /// The combination of per-node seqlocks and atomic root/allocation indices ensures that
 /// concurrent operations are correctly synchronized.
-unsafe impl Sync for BTree {}
+unsafe impl<K, V> Sync for BTree<K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{}
 
-/// SAFETY: BTree is Send because all its fields can be safely transferred between threads:
-/// - `pages`: Vec<Node> where Node is Sync (seqlock-protected)
+/// SAFETY: BTree<K, V> is Send because all its fields can be safely transferred between threads:
+/// - `pages`: Vec<Node<K, V>> where Node<K, V> is Sync (seqlock-protected)
 /// - `next_free_idx`: AtomicUsize (inherently Send)
 /// - `root_id`: AtomicU32 (inherently Send)
-unsafe impl Send for BTree {}
+unsafe impl<K, V> Send for BTree<K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{}
 
-impl BTree {
+impl<K, V> BTree<K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
     pub fn new() -> Self {
         let max_nodes = 100_000;
         let mut pages = Vec::with_capacity(1024);
@@ -121,7 +152,7 @@ impl BTree {
         }
     }
 
-    fn node(&self, id: NodeId) -> &Node {
+    fn node(&self, id: NodeId) -> &Node<K, V> {
         unsafe {
             let ptr = self.pages.get();
             let slice = &*ptr;
@@ -139,8 +170,8 @@ impl BTree {
         let n = self.node(NodeId(idx as u32));
 
         unsafe {
-            *n.keys.get() = [0; CAPACITY];
-            *n.values.get() = [0; CAPACITY];
+            *n.keys.get() = [K::default(); CAPACITY];
+            *n.values.get() = [V::default(); CAPACITY];
             *n.children.get() = [None; CAPACITY + 1];
             *n.len.get() = 0;
             *n.is_leaf.get() = is_leaf;
@@ -149,7 +180,7 @@ impl BTree {
         NodeId(idx as u32)
     }
 
-    pub fn search(&self, key: u64) -> Option<u64> {
+    pub fn search(&self, key: K) -> Option<V> {
         'restart: loop {
             let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
 
@@ -195,7 +226,7 @@ impl BTree {
         }
     }
 
-    pub fn insert(&self, key: u64, value: u64) {
+    pub fn insert(&self, key: K, value: V) {
         if let Some(success) = self.insert_optimistic(key, value) {
             if success { return; }
         }
@@ -203,7 +234,7 @@ impl BTree {
         self.insert_pessimistic(key, value);
     }
 
-    fn insert_optimistic(&self, key: u64, value: u64) -> Option<bool> {
+    fn insert_optimistic(&self, key: K, value: V) -> Option<bool> {
         let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
 
         loop {
@@ -265,7 +296,7 @@ impl BTree {
         }
     }
 
-    fn insert_pessimistic(&self, key: u64, value: u64) {
+    fn insert_pessimistic(&self, key: K, value: V) {
         let root_id = loop {
             let root_id = NodeId(self.root_id.load(Ordering::Acquire));
             let root = self.node(root_id);
@@ -288,10 +319,9 @@ impl BTree {
             }
 
             self.split_child(new_root_id, 0);
-            
+
             self.root_id.store(new_root_id.0, Ordering::Release);
-            
-            root.write_unlock();
+
             new_root_id
         } else {
             root.write_unlock();
@@ -301,7 +331,7 @@ impl BTree {
         self.insert_pessimistic_non_full(current_root_id, key, value);
     }
 
-    fn insert_pessimistic_non_full(&self, node_id: NodeId, key: u64, value: u64) {
+    fn insert_pessimistic_non_full(&self, node_id: NodeId, key: K, value: V) {
         let node = self.node(node_id);
 
         node.write_lock();
@@ -392,7 +422,7 @@ impl BTree {
         child.write_unlock();
     }
 
-    fn allocate_and_distribute(&self, left_id: NodeId) -> (u64, u64, NodeId) {
+    fn allocate_and_distribute(&self, left_id: NodeId) -> (K, V, NodeId) {
         let left = self.node(left_id);
         let is_leaf = unsafe { *left.is_leaf.get() };
 
@@ -430,7 +460,13 @@ impl BTree {
 
         (mid_key, mid_val, right_id)
     }
-    
+}
+
+impl<K, V> BTree<K, V>
+where
+    K: Copy + Ord + Default + std::fmt::Debug,
+    V: Copy + Default,
+{
     pub fn print(&self) {
         println!("=== B-Tree Structure (Arena + OLC) ===");
         self.print_subtree(NodeId(self.root_id.load(Ordering::Acquire)), 0);
@@ -468,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_thread_safe_insert_search() {
-        let tree = BTree::new();
+        let tree = BTree::<u64, u64>::new();
 
         tree.insert(10, 100);
         tree.insert(20, 200);
@@ -482,12 +518,25 @@ mod tests {
 
     #[test]
     fn test_splitting_logic() {
-        let tree = BTree::new();
-        for i in 0..20 {
+        let tree = BTree::<u64, u64>::new();
+        for i in 0..20u64 {
             tree.insert(i, i * 10);
         }
-        for i in 0..20 {
+        for i in 0..20u64 {
             assert_eq!(tree.search(i), Some(i * 10));
         }
+    }
+
+    #[test]
+    fn test_generic_with_i32() {
+        let tree = BTree::<i32, i32>::new();
+        tree.insert(-10, 100);
+        tree.insert(0, 0);
+        tree.insert(10, -100);
+
+        assert_eq!(tree.search(-10), Some(100));
+        assert_eq!(tree.search(0), Some(0));
+        assert_eq!(tree.search(10), Some(-100));
+        assert_eq!(tree.search(5), None);
     }
 }
