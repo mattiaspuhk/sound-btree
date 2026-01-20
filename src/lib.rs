@@ -1,5 +1,5 @@
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU32, AtomicUsize, Ordering};
 use std::marker::Sync;
 
 const B: usize = 6;
@@ -64,7 +64,7 @@ impl Node {
 pub struct BTree {
     pages: UnsafeCell<Vec<Node>>,
     next_free_idx: AtomicUsize,
-    root_id: NodeId,
+    root_id: AtomicU32,
 }
 
 unsafe impl Sync for BTree {}
@@ -81,14 +81,15 @@ impl BTree {
         BTree {
             pages: UnsafeCell::new(pages),
             next_free_idx: AtomicUsize::new(1),
-            root_id: NodeId(0),
+            root_id: AtomicU32::new(0),
         }
     }
 
     fn node(&self, id: NodeId) -> &Node {
         unsafe {
             let ptr = self.pages.get();
-            &(*ptr)[id.0 as usize]
+            let slice = &*ptr;
+            &slice[id.0 as usize]
         }
     }
 
@@ -108,14 +109,14 @@ impl BTree {
             *n.len.get() = 0;
             let ptr = n as *const Node as *mut Node;
             (*ptr).is_leaf = is_leaf;
-            (*ptr).version = AtomicU64::new(0);
+            (*ptr).version.store(0, Ordering::Release);
         }
         NodeId(idx as u32)
     }
 
     pub fn search(&self, key: u64) -> Option<u64> {
         'restart: loop {
-            let mut current_id = self.root_id;
+            let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
 
             loop {
                 let node = self.node(current_id);
@@ -159,7 +160,7 @@ impl BTree {
         }
     }
 
-    pub fn insert(self, key: u64, value: u64) {
+    pub fn insert(&self, key: u64, value: u64) {
         if let Some(success) = self.insert_optimistic(key, value) {
             if success { return; }
         }
@@ -168,7 +169,7 @@ impl BTree {
     }
 
     fn insert_optimistic(&self, key: u64, value: u64) -> Option<bool> {
-        let mut current_id = self.root_id;
+        let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
 
         loop {
             let node = self.node(current_id);
@@ -198,7 +199,7 @@ impl BTree {
                 Err(_) => {
                     node.write_lock();
 
-                    let is_full = unsafe { *node.len.get() <= CAPACITY };
+                    let is_full = unsafe { *node.len.get() >= CAPACITY };
 
                     if is_full {
                         node.write_unlock();
@@ -230,25 +231,32 @@ impl BTree {
     }
 
     fn insert_pessimistic(&self, key: u64, value: u64) {
-        let root = self.node(self.root_id);
+        let root_id = NodeId(self.root_id.load(Ordering::Acquire));
+        let root = self.node(root_id);
 
         root.write_lock();
         let root_full = unsafe { *root.len.get() == CAPACITY };
 
-        if root_full {
+        let current_root_id = if root_full {
             let new_root_id = self.new_node(false);
             let new_root = self.node(new_root_id);
 
             unsafe {
-                (*new_root.children.get())[0] = Some(self.root_id);
+                (*new_root.children.get())[0] = Some(root_id);
             }
 
             self.split_child(new_root_id, 0);
-        }
+            
+            self.root_id.store(new_root_id.0, Ordering::Release);
+            
+            root.write_unlock();
+            new_root_id
+        } else {
+            root.write_unlock();
+            root_id
+        };
 
-        root.write_unlock();
-
-        self.insert_pessimistic_non_full(self.root_id, key, value);
+        self.insert_pessimistic_non_full(current_root_id, key, value);
     }
 
     fn insert_pessimistic_non_full(&self, node_id: NodeId, key: u64, value: u64) {
@@ -295,13 +303,10 @@ impl BTree {
                 if child_full {
                     self.split_child(node_id, idx);
 
-                    let go_right = unsafe {
-                        let keys = &*node.keys.get();
-                        key > keys[idx]
-                    };
+                    let go_right = key > keys[idx];
 
                     if go_right {
-                        let right_id = unsafe { (*node.children.get())[idx+1].unwrap() };
+                        let right_id = children[idx+1].unwrap();
                         node.write_unlock();
                         self.insert_pessimistic_non_full(right_id, key, value);
                     } else {
@@ -346,7 +351,6 @@ impl BTree {
     }
 
     fn allocate_and_distribute(&self, left_id: NodeId) -> (u64, u64, NodeId) {
-        // Left is ALREADY locked
         let left = self.node(left_id);
         let is_leaf = left.is_leaf;
 
@@ -366,7 +370,6 @@ impl BTree {
             let r_vals = &mut *right.values.get();
             let r_children = &mut *right.children.get();
 
-            // Copy data to Right
             r_keys[0..count].copy_from_slice(&l_keys[mid + 1..mid + 1 + count]);
             r_vals[0..count].copy_from_slice(&l_vals[mid + 1..mid + 1 + count]);
 
@@ -385,10 +388,10 @@ impl BTree {
 
         (mid_key, mid_val, right_id)
     }
-
+    
     pub fn print(&self) {
         println!("=== B-Tree Structure (Arena + OLC) ===");
-        self.print_subtree(self.root_id, 0);
+        self.print_subtree(NodeId(self.root_id.load(Ordering::Acquire)), 0);
         println!("======================================");
     }
 
@@ -396,12 +399,14 @@ impl BTree {
         let node = self.node(node_id);
         let indent = "  ".repeat(depth);
         unsafe {
+            let keys_slice = &*node.keys.get();
+            let len = *node.len.get();
             println!(
                 "{}Node[{}] (Leaf: {}) Keys: {:?}",
                 indent,
                 node_id.0,
                 node.is_leaf,
-                &(*node.keys.get())[0..*node.len.get()]
+                &keys_slice[0..len]
             );
             if !node.is_leaf {
                 for i in 0..=*node.len.get() {
@@ -414,14 +419,13 @@ impl BTree {
     }
 }
 
-// Tests (Same as before)
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_thread_safe_insert_search() {
-        let tree = BTree::new(); // Immutable binding, but internal mutability via UnsafeCell
+        let tree = BTree::new();
 
         tree.insert(10, 100);
         tree.insert(20, 200);
