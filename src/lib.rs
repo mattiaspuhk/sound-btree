@@ -19,6 +19,24 @@ pub struct Node {
     pub is_leaf: UnsafeCell<bool>,
 }
 
+/// SAFETY: Node is Sync because concurrent access is mediated by the seqlock protocol:
+///
+/// 1. **Writers** must hold the write lock (version is odd) before accessing any `UnsafeCell`
+///    field. The lock is acquired via `write_lock()` and released via `write_unlock()`.
+///
+/// 2. **Readers** use Optimistic Lock Coupling (OLC):
+///    - Snapshot the version (must be even, meaning unlocked)
+///    - Read data from `UnsafeCell` fields
+///    - Validate that version hasn't changed
+///    - Retry the entire operation if validation fails
+///
+/// 3. **Initialization**: New nodes are fully initialized (including `is_leaf`) before
+///    their `NodeId` is made visible to other threads. The `Release` ordering on
+///    `version.store(0)` in `new_node` synchronizes with the `Acquire` on version reads.
+///
+/// These invariants ensure that data races cannot occur: either a reader sees a consistent
+/// snapshot (validation succeeds) or it detects concurrent modification (validation fails
+/// and triggers retry).
 unsafe impl Sync for Node {}
 
 impl Node {
@@ -67,7 +85,25 @@ pub struct BTree {
     root_id: AtomicU32,
 }
 
+/// SAFETY: BTree is Sync because:
+///
+/// 1. **`pages` (UnsafeCell<Vec<Node>>)**: The Vec itself is never resized after construction
+///    (pre-allocated arena). Individual Node access is synchronized via each Node's seqlock.
+///
+/// 2. **`next_free_idx` (AtomicUsize)**: Atomic, inherently thread-safe. Used for allocating
+///    new nodes with `fetch_add`.
+///
+/// 3. **`root_id` (AtomicU32)**: Atomic, inherently thread-safe. Root changes are protected
+///    by locking the old root before updating this field.
+///
+/// The combination of per-node seqlocks and atomic root/allocation indices ensures that
+/// concurrent operations are correctly synchronized.
 unsafe impl Sync for BTree {}
+
+/// SAFETY: BTree is Send because all its fields can be safely transferred between threads:
+/// - `pages`: Vec<Node> where Node is Sync (seqlock-protected)
+/// - `next_free_idx`: AtomicUsize (inherently Send)
+/// - `root_id`: AtomicU32 (inherently Send)
 unsafe impl Send for BTree {}
 
 impl BTree {
@@ -307,7 +343,6 @@ impl BTree {
             let child = self.node(child_id);
             child.write_lock();
             let child_full = unsafe { *child.len.get() == CAPACITY };
-            child.write_unlock();
 
             if child_full {
                 self.split_child(node_id, idx);
@@ -323,6 +358,7 @@ impl BTree {
                     self.insert_pessimistic_non_full(child_id, key, value);
                 }
             } else {
+                child.write_unlock();
                 node.write_unlock();
                 self.insert_pessimistic_non_full(child_id, key, value);
             }
@@ -334,8 +370,6 @@ impl BTree {
 
         let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
         let child = self.node(child_id);
-
-        child.write_lock();
 
         let (mid_key, mid_val, right_id) = self.allocate_and_distribute(child_id);
 
