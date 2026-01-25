@@ -12,3 +12,18 @@ rand = "0.8"
 [[bench]]
 name = "benchmark"
 harness = false
+
+# Default release profile (panic=unwind for comparison baseline)
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Release with panic=abort (better performance, no unwinding overhead)
+[profile.release-abort]
+inherits = "release"
+panic = "abort"
+
+# Benchmark profile (inherits from release)
+[profile.bench]
+opt-level = 3
+lto = "thin"
