@@ -199,7 +199,11 @@ where
         let mut pages = Vec::with_capacity(max_nodes);
         pages.push(Node::new(true));
         for _ in 1..max_nodes {
-            pages.push(Node::new_uninit());
+            let node = Node::new_uninit();
+            unsafe {
+                std::ptr::write_volatile(node.keys.get() as *mut u8, 0);
+            }
+            pages.push(node);
         }
 
         BTree {
@@ -273,6 +277,11 @@ where
             panic!("Arena OOM: Tree exceeded capacity of {} nodes. Use BTree::with_capacity() for larger trees.", self.capacity);
         }
 
+        if idx + 1 < self.capacity {
+            let next_node = self.node(NodeId((idx + 1) as u32));
+            Self::prefetch_node(next_node);
+        }
+
         let n = self.node(NodeId(idx as u32));
 
         unsafe {
@@ -284,6 +293,21 @@ where
             n.version.store(0, Ordering::Release);
         }
         NodeId(idx as u32)
+    }
+
+    #[inline]
+    fn prefetch_node(node: &Node<K, V>) {
+        let ptr = node.keys.get() as *const i8;
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(ptr, std::arch::x86_64::_MM_HINT_T0);
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        unsafe {
+            std::ptr::read_volatile(ptr);
+        }
     }
 
     pub fn search(&self, key: K) -> Option<V> {
