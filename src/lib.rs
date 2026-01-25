@@ -1,9 +1,12 @@
+#![allow(clippy::manual_is_multiple_of)]
+
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, AtomicU32, AtomicUsize, Ordering};
 use std::marker::Sync;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const B: usize = 6;
 const CAPACITY: usize = 2 * B - 1;
+const MIN_KEYS: usize = B - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeId(u32);
@@ -83,20 +86,27 @@ where
 
     pub fn validate(&self, start_version: u64) -> bool {
         let current = self.version.load(Ordering::Acquire);
-        current == start_version && (current % 2 == 0)
+        current == start_version && current % 2 == 0
     }
 
     pub fn write_lock(&self) {
         let mut backoff = 0;
         loop {
             let v = self.version.load(Ordering::Relaxed);
-            if v % 2 == 0 {
-                if self.version.compare_exchange_weak(v, v + 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                    return;
-                }
+            if v % 2 == 0
+                && self
+                    .version
+                    .compare_exchange_weak(v, v + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
             }
-            for _ in 0..(1 << backoff) { std::hint::spin_loop(); }
-            if backoff < 6 { backoff += 1; }
+            for _ in 0..(1 << backoff) {
+                std::hint::spin_loop();
+            }
+            if backoff < 6 {
+                backoff += 1;
+            }
         }
     }
 
@@ -145,6 +155,16 @@ where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {}
+
+impl<K, V> Default for BTree<K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl<K, V> BTree<K, V>
 where
@@ -297,8 +317,8 @@ where
     }
 
     pub fn insert(&self, key: K, value: V) {
-        if let Some(success) = self.insert_optimistic(key, value) {
-            if success { return; }
+        if let Some(true) = self.insert_optimistic(key, value) {
+            return;
         }
 
         self.insert_pessimistic(key, value);
@@ -544,6 +564,476 @@ where
 
         (mid_key, mid_val, right_id)
     }
+
+    pub fn delete(&self, key: K) -> Option<V> {
+        if let Some(result) = self.delete_optimistic(key) {
+            if result.is_some() {
+                self.entry_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            return result;
+        }
+
+        let result = self.delete_pessimistic(key);
+        if result.is_some() {
+            self.entry_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn delete_optimistic(&self, key: K) -> Option<Option<V>> {
+        let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
+
+        loop {
+            let node = self.node(current_id);
+            let start_version = node.read_version();
+
+            // Must be even (unlocked) to read
+            if start_version % 2 != 0 {
+                return None;
+            }
+
+            let next_step = unsafe {
+                let len = *node.len.get();
+                let keys = &*node.keys.get();
+                let is_leaf = *node.is_leaf.get();
+
+                if is_leaf {
+                    match keys[0..len].binary_search(&key) {
+                        Ok(idx) => Err(Some(idx)),
+                        Err(_) => Err(None),
+                    }
+                } else {
+                    match keys[0..len].binary_search(&key) {
+                        Ok(_) => {
+                            // Key is in internal node - need pessimistic path
+                            return None;
+                        }
+                        Err(idx) => Ok((*node.children.get())[idx]),
+                    }
+                }
+            };
+
+            if !node.validate(start_version) {
+                return None;
+            }
+
+            match next_step {
+                Ok(Some(child_id)) => current_id = child_id,
+                Ok(None) => return None,
+                Err(Some(idx)) => {
+                    node.write_lock();
+
+                    // Re-check conditions under lock
+                    let can_delete = unsafe {
+                        let len = *node.len.get();
+                        let is_leaf = *node.is_leaf.get();
+                        let keys = &*node.keys.get();
+                        let is_root = current_id.0 == self.root_id.load(Ordering::Relaxed);
+
+                        // Can delete if: still a leaf, key at same position,
+                        // and (has enough keys OR is root)
+                        is_leaf
+                            && (len > MIN_KEYS || is_root)
+                            && matches!(keys[0..len].binary_search(&key), Ok(found_idx) if found_idx == idx)
+                    };
+
+                    if !can_delete {
+                        node.write_unlock();
+                        return None;
+                    }
+
+                    let value = self.remove_from_leaf(current_id, idx);
+                    node.write_unlock();
+                    return Some(Some(value));
+                }
+                Err(None) => {
+                    return Some(None);
+                }
+            }
+        }
+    }
+
+    fn delete_pessimistic(&self, key: K) -> Option<V> {
+        let root_id = loop {
+            let root_id = NodeId(self.root_id.load(Ordering::Acquire));
+            let root = self.node(root_id);
+            root.write_lock();
+            let current_root = NodeId(self.root_id.load(Ordering::Acquire));
+            if current_root == root_id {
+                break root_id;
+            }
+            root.write_unlock();
+        };
+
+        let result = self.delete_from_subtree(root_id, key);
+
+        let root = self.node(root_id);
+        let (should_shrink, new_root) = unsafe {
+            let len = *root.len.get();
+            let is_leaf = *root.is_leaf.get();
+            if len == 0 && !is_leaf {
+                (true, (*root.children.get())[0].unwrap())
+            } else {
+                (false, root_id)
+            }
+        };
+
+        if should_shrink {
+            self.root_id.store(new_root.0, Ordering::Release);
+        }
+
+        root.write_unlock();
+        result
+    }
+
+    fn delete_from_subtree(&self, node_id: NodeId, key: K) -> Option<V> {
+        let node = self.node(node_id);
+
+        let (is_leaf, len) = unsafe { (*node.is_leaf.get(), *node.len.get()) };
+
+        let keys_ptr = node.keys.get();
+        let search_result = unsafe {
+            let keys = &*keys_ptr;
+            keys[0..len].binary_search(&key)
+        };
+
+        if is_leaf {
+            match search_result {
+                Ok(idx) => Some(self.remove_from_leaf(node_id, idx)),
+                Err(_) => None,
+            }
+        } else {
+            match search_result {
+                Ok(idx) => {
+                    Some(self.remove_from_internal(node_id, idx, key))
+                }
+                Err(idx) => {
+                    let child_id = self.ensure_child_can_lose_key(node_id, idx);
+
+                    let child = self.node(child_id);
+                    child.write_lock();
+
+                    let result = self.delete_from_subtree(child_id, key);
+
+                    child.write_unlock();
+                    result
+                }
+            }
+        }
+    }
+
+    fn ensure_child_can_lose_key(&self, parent_id: NodeId, child_idx: usize) -> NodeId {
+        let parent = self.node(parent_id);
+
+        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
+        let child = self.node(child_id);
+        child.write_lock();
+
+        let child_len = unsafe { *child.len.get() };
+
+        if child_len > MIN_KEYS {
+            child.write_unlock();
+            return child_id;
+        }
+
+        let parent_len = unsafe { *parent.len.get() };
+
+        if child_idx > 0 {
+            let left_id = unsafe { (*parent.children.get())[child_idx - 1].unwrap() };
+            let left = self.node(left_id);
+            left.write_lock();
+
+            let left_len = unsafe { *left.len.get() };
+            if left_len > MIN_KEYS {
+                self.borrow_from_left(parent_id, child_idx);
+                left.write_unlock();
+                child.write_unlock();
+                return child_id;
+            }
+
+            let merged_id = self.merge_with_left(parent_id, child_idx);
+            left.write_unlock();
+            child.write_unlock();
+            return merged_id;
+        }
+
+        if child_idx < parent_len {
+            let right_id = unsafe { (*parent.children.get())[child_idx + 1].unwrap() };
+            let right = self.node(right_id);
+            right.write_lock();
+
+            let right_len = unsafe { *right.len.get() };
+            if right_len > MIN_KEYS {
+                self.borrow_from_right(parent_id, child_idx);
+                right.write_unlock();
+                child.write_unlock();
+                return child_id;
+            }
+
+            let merged_id = self.merge_with_right(parent_id, child_idx);
+            right.write_unlock();
+            child.write_unlock();
+            return merged_id;
+        }
+
+        child.write_unlock();
+        child_id
+    }
+
+    fn borrow_from_left(&self, parent_id: NodeId, child_idx: usize) {
+        let parent = self.node(parent_id);
+        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
+        let left_id = unsafe { (*parent.children.get())[child_idx - 1].unwrap() };
+
+        let child = self.node(child_id);
+        let left = self.node(left_id);
+
+        unsafe {
+            let p_keys = &mut *parent.keys.get();
+            let p_vals = &mut *parent.values.get();
+
+            let c_keys = &mut *child.keys.get();
+            let c_vals = &mut *child.values.get();
+            let c_children = &mut *child.children.get();
+            let c_len = *child.len.get();
+
+            let l_keys = &mut *left.keys.get();
+            let l_vals = &mut *left.values.get();
+            let l_children = &mut *left.children.get();
+            let l_len = *left.len.get();
+
+            c_keys.copy_within(0..c_len, 1);
+            c_vals.copy_within(0..c_len, 1);
+            if !*child.is_leaf.get() {
+                c_children.copy_within(0..=c_len, 1);
+            }
+
+            c_keys[0] = p_keys[child_idx - 1];
+            c_vals[0] = p_vals[child_idx - 1];
+
+            p_keys[child_idx - 1] = l_keys[l_len - 1];
+            p_vals[child_idx - 1] = l_vals[l_len - 1];
+
+            if !*child.is_leaf.get() {
+                c_children[0] = l_children[l_len];
+            }
+
+            *child.len.get() += 1;
+            *left.len.get() -= 1;
+        }
+    }
+
+    fn borrow_from_right(&self, parent_id: NodeId, child_idx: usize) {
+        let parent = self.node(parent_id);
+        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
+        let right_id = unsafe { (*parent.children.get())[child_idx + 1].unwrap() };
+
+        let child = self.node(child_id);
+        let right = self.node(right_id);
+
+        unsafe {
+            let p_keys = &mut *parent.keys.get();
+            let p_vals = &mut *parent.values.get();
+
+            let c_keys = &mut *child.keys.get();
+            let c_vals = &mut *child.values.get();
+            let c_children = &mut *child.children.get();
+            let c_len = *child.len.get();
+
+            let r_keys = &mut *right.keys.get();
+            let r_vals = &mut *right.values.get();
+            let r_children = &mut *right.children.get();
+            let r_len = *right.len.get();
+
+            c_keys[c_len] = p_keys[child_idx];
+            c_vals[c_len] = p_vals[child_idx];
+
+            if !*child.is_leaf.get() {
+                c_children[c_len + 1] = r_children[0];
+            }
+
+            p_keys[child_idx] = r_keys[0];
+            p_vals[child_idx] = r_vals[0];
+
+            r_keys.copy_within(1..r_len, 0);
+            r_vals.copy_within(1..r_len, 0);
+            if !*child.is_leaf.get() {
+                r_children.copy_within(1..=r_len, 0);
+            }
+
+            *child.len.get() += 1;
+            *right.len.get() -= 1;
+        }
+    }
+
+    fn merge_with_left(&self, parent_id: NodeId, child_idx: usize) -> NodeId {
+        let parent = self.node(parent_id);
+        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
+        let left_id = unsafe { (*parent.children.get())[child_idx - 1].unwrap() };
+
+        let child = self.node(child_id);
+        let left = self.node(left_id);
+
+        unsafe {
+            let p_keys = &mut *parent.keys.get();
+            let p_vals = &mut *parent.values.get();
+            let p_children = &mut *parent.children.get();
+            let p_len = *parent.len.get();
+
+            let c_keys = &*child.keys.get();
+            let c_vals = &*child.values.get();
+            let c_children = &*child.children.get();
+            let c_len = *child.len.get();
+
+            let l_keys = &mut *left.keys.get();
+            let l_vals = &mut *left.values.get();
+            let l_children = &mut *left.children.get();
+            let l_len = *left.len.get();
+
+            l_keys[l_len] = p_keys[child_idx - 1];
+            l_vals[l_len] = p_vals[child_idx - 1];
+
+            l_keys[l_len + 1..l_len + 1 + c_len].copy_from_slice(&c_keys[0..c_len]);
+            l_vals[l_len + 1..l_len + 1 + c_len].copy_from_slice(&c_vals[0..c_len]);
+
+            if !*child.is_leaf.get() {
+                l_children[l_len + 1..l_len + 2 + c_len].copy_from_slice(&c_children[0..=c_len]);
+            }
+
+            *left.len.get() = l_len + 1 + c_len;
+
+            p_keys.copy_within(child_idx..p_len, child_idx - 1);
+            p_vals.copy_within(child_idx..p_len, child_idx - 1);
+            p_children.copy_within(child_idx + 1..=p_len, child_idx);
+            *parent.len.get() -= 1;
+        }
+
+        left_id
+    }
+
+    fn merge_with_right(&self, parent_id: NodeId, child_idx: usize) -> NodeId {
+        let parent = self.node(parent_id);
+        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
+        let right_id = unsafe { (*parent.children.get())[child_idx + 1].unwrap() };
+
+        let child = self.node(child_id);
+        let right = self.node(right_id);
+
+        unsafe {
+            let p_keys = &mut *parent.keys.get();
+            let p_vals = &mut *parent.values.get();
+            let p_children = &mut *parent.children.get();
+            let p_len = *parent.len.get();
+
+            let c_keys = &mut *child.keys.get();
+            let c_vals = &mut *child.values.get();
+            let c_children = &mut *child.children.get();
+            let c_len = *child.len.get();
+
+            let r_keys = &*right.keys.get();
+            let r_vals = &*right.values.get();
+            let r_children = &*right.children.get();
+            let r_len = *right.len.get();
+
+            c_keys[c_len] = p_keys[child_idx];
+            c_vals[c_len] = p_vals[child_idx];
+
+            c_keys[c_len + 1..c_len + 1 + r_len].copy_from_slice(&r_keys[0..r_len]);
+            c_vals[c_len + 1..c_len + 1 + r_len].copy_from_slice(&r_vals[0..r_len]);
+
+            if !*child.is_leaf.get() {
+                c_children[c_len + 1..c_len + 2 + r_len].copy_from_slice(&r_children[0..=r_len]);
+            }
+
+            *child.len.get() = c_len + 1 + r_len;
+
+            p_keys.copy_within(child_idx + 1..p_len, child_idx);
+            p_vals.copy_within(child_idx + 1..p_len, child_idx);
+            p_children.copy_within(child_idx + 2..=p_len, child_idx + 1);
+            *parent.len.get() -= 1;
+        }
+
+        child_id
+    }
+
+    fn remove_from_internal(&self, node_id: NodeId, idx: usize, key: K) -> V {
+        let node = self.node(node_id);
+
+        let old_value = unsafe { (*node.values.get())[idx] };
+
+        let left_child_id = self.ensure_child_can_lose_key(node_id, idx);
+
+        let current_len = unsafe { *node.len.get() };
+
+        let key_still_here = unsafe {
+            let keys = &*node.keys.get();
+            idx < current_len && keys[idx] == key
+        };
+
+        if key_still_here {
+            let (pred_key, pred_val) = self.delete_max_from_subtree(left_child_id);
+
+            unsafe {
+                (*node.keys.get())[idx] = pred_key;
+                (*node.values.get())[idx] = pred_val;
+            }
+        } else {
+            let child = self.node(left_child_id);
+            child.write_lock();
+            let _ = self.delete_from_subtree(left_child_id, key);
+            child.write_unlock();
+        }
+
+        old_value
+    }
+
+    fn delete_max_from_subtree(&self, node_id: NodeId) -> (K, V) {
+        let node = self.node(node_id);
+        node.write_lock();
+
+        let is_leaf = unsafe { *node.is_leaf.get() };
+
+        if is_leaf {
+            let len = unsafe { *node.len.get() };
+            let result = unsafe {
+                let keys = &*node.keys.get();
+                let vals = &*node.values.get();
+                (keys[len - 1], vals[len - 1])
+            };
+            unsafe { *node.len.get() -= 1 };
+            node.write_unlock();
+            result
+        } else {
+            let len = unsafe { *node.len.get() };
+            let rightmost_idx = len;
+
+            let child_id = self.ensure_child_can_lose_key(node_id, rightmost_idx);
+
+            let result = self.delete_max_from_subtree(child_id);
+
+            node.write_unlock();
+            result
+        }
+    }
+
+    fn remove_from_leaf(&self, node_id: NodeId, idx: usize) -> V {
+        let node = self.node(node_id);
+
+        unsafe {
+            let len = *node.len.get();
+            let keys = &mut *node.keys.get();
+            let vals = &mut *node.values.get();
+
+            let value = vals[idx];
+
+            keys.copy_within(idx + 1..len, idx);
+            vals.copy_within(idx + 1..len, idx);
+
+            *node.len.get() -= 1;
+
+            value
+        }
+    }
 }
 
 impl<K, V> BTree<K, V>
@@ -690,5 +1180,291 @@ mod tests {
         tree.insert(100, 1000);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree.search(100), Some(1000));
+    }
+
+    #[test]
+    fn test_delete_single_key() {
+        let tree = BTree::<u64, u64>::new();
+        tree.insert(10, 100);
+        assert_eq!(tree.delete(10), Some(100));
+        assert_eq!(tree.search(10), None);
+        assert_eq!(tree.len(), 0);
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_delete_nonexistent_key() {
+        let tree = BTree::<u64, u64>::new();
+        tree.insert(10, 100);
+        assert_eq!(tree.delete(20), None);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree.search(10), Some(100));
+    }
+
+    #[test]
+    fn test_delete_from_empty_tree() {
+        let tree = BTree::<u64, u64>::new();
+        assert_eq!(tree.delete(10), None);
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_delete_multiple_keys() {
+        let tree = BTree::<u64, u64>::new();
+        for i in 0..10u64 {
+            tree.insert(i, i * 10);
+        }
+        assert_eq!(tree.len(), 10);
+
+        assert_eq!(tree.delete(5), Some(50));
+        assert_eq!(tree.len(), 9);
+        assert_eq!(tree.search(5), None);
+
+        assert_eq!(tree.delete(0), Some(0));
+        assert_eq!(tree.len(), 8);
+
+        assert_eq!(tree.delete(9), Some(90));
+        assert_eq!(tree.len(), 7);
+
+        for i in [1, 2, 3, 4, 6, 7, 8] {
+            assert_eq!(tree.search(i), Some(i * 10));
+        }
+    }
+
+    #[test]
+    fn test_delete_all_keys() {
+        let tree = BTree::<u64, u64>::new();
+        for i in 0..50u64 {
+            tree.insert(i, i * 10);
+        }
+        assert_eq!(tree.len(), 50);
+
+        for i in 0..50u64 {
+            assert_eq!(tree.delete(i), Some(i * 10), "Failed to delete key {}", i);
+        }
+        assert!(tree.is_empty());
+
+        tree.insert(100, 1000);
+        assert_eq!(tree.search(100), Some(1000));
+    }
+
+    #[test]
+    fn test_delete_causes_underflow() {
+        let tree = BTree::<u64, u64>::new();
+        for i in 0..30u64 {
+            tree.insert(i, i * 10);
+        }
+
+        for i in 0..30u64 {
+            let result = tree.delete(i);
+            assert_eq!(result, Some(i * 10), "Failed to delete key {}", i);
+            assert_eq!(tree.search(i), None);
+        }
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_delete_reverse_order() {
+        let tree = BTree::<u64, u64>::new();
+        for i in 0..50u64 {
+            tree.insert(i, i * 10);
+        }
+
+        for i in (0..50u64).rev() {
+            assert_eq!(tree.delete(i), Some(i * 10));
+        }
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_delete_alternating() {
+        let tree = BTree::<u64, u64>::new();
+        for i in 0..100u64 {
+            tree.insert(i, i * 10);
+        }
+
+        for i in (0..100u64).step_by(2) {
+            assert_eq!(tree.delete(i), Some(i * 10));
+        }
+        assert_eq!(tree.len(), 50);
+
+        for i in (1..100u64).step_by(2) {
+            assert_eq!(tree.search(i), Some(i * 10));
+        }
+
+        for i in (1..100u64).step_by(2) {
+            assert_eq!(tree.delete(i), Some(i * 10));
+        }
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_delete_then_insert() {
+        let tree = BTree::<u64, u64>::new();
+        for i in 0..20u64 {
+            tree.insert(i, i * 10);
+        }
+        assert_eq!(tree.len(), 20);
+
+        assert_eq!(tree.delete(5), Some(50));
+        assert_eq!(tree.search(5), None, "Key 5 should be deleted");
+        assert_eq!(tree.len(), 19);
+
+        assert_eq!(tree.delete(10), Some(100));
+        assert_eq!(tree.search(10), None, "Key 10 should be deleted");
+        assert_eq!(tree.len(), 18);
+
+        assert_eq!(tree.delete(15), Some(150));
+        assert_eq!(tree.search(15), None, "Key 15 should be deleted");
+        assert_eq!(tree.len(), 17);
+
+        tree.insert(5, 500);
+        assert_eq!(tree.len(), 18);
+
+        tree.insert(10, 1000);
+        assert_eq!(tree.len(), 19);
+
+        tree.insert(15, 1500);
+        assert_eq!(tree.len(), 20);
+
+        assert_eq!(tree.search(5), Some(500));
+        assert_eq!(tree.search(10), Some(1000));
+        assert_eq!(tree.search(15), Some(1500));
+    }
+
+    #[test]
+    fn test_delete_large_tree() {
+        let tree = BTree::<u64, u64>::new();
+        for i in 0..1000u64 {
+            tree.insert(i, i * 10);
+        }
+        assert_eq!(tree.len(), 1000);
+
+        for i in (0..1000u64).step_by(2) {
+            assert_eq!(tree.delete(i), Some(i * 10));
+        }
+        assert_eq!(tree.len(), 500);
+
+        for i in (1..1000u64).step_by(2) {
+            assert_eq!(tree.search(i), Some(i * 10));
+        }
+    }
+
+    #[test]
+    fn test_concurrent_delete() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tree = Arc::new(BTree::<u64, u64>::new());
+
+        for i in 0..1000u64 {
+            tree.insert(i, i * 10);
+        }
+        assert_eq!(tree.len(), 1000);
+
+        let mut handles = vec![];
+        for t in 0..4 {
+            let tree_ref = tree.clone();
+            handles.push(thread::spawn(move || {
+                for i in (t * 250)..((t + 1) * 250) {
+                    tree_ref.delete(i as u64);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_insert_delete() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tree = Arc::new(BTree::<u64, u64>::new());
+
+        for i in 0..500u64 {
+            tree.insert(i, i * 10);
+        }
+
+        let mut handles = vec![];
+
+        for t in 0..2 {
+            let tree_ref = tree.clone();
+            handles.push(thread::spawn(move || {
+                for i in (500 + t * 250)..(500 + (t + 1) * 250) {
+                    tree_ref.insert(i as u64, (i * 10) as u64);
+                }
+            }));
+        }
+
+        for t in 0..2 {
+            let tree_ref = tree.clone();
+            handles.push(thread::spawn(move || {
+                for i in (t * 250)..((t + 1) * 250) {
+                    tree_ref.delete(i as u64);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(tree.len(), 500);
+
+        for i in 500..1000u64 {
+            assert_eq!(tree.search(i), Some(i * 10));
+        }
+
+        for i in 0..500u64 {
+            assert_eq!(tree.search(i), None);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_search_delete() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tree = Arc::new(BTree::<u64, u64>::new());
+        let done = Arc::new(AtomicBool::new(false));
+
+        for i in 0..1000u64 {
+            tree.insert(i, i * 10);
+        }
+
+        let mut handles = vec![];
+
+        for _ in 0..2 {
+            let tree_ref = tree.clone();
+            let done_ref = done.clone();
+            handles.push(thread::spawn(move || {
+                while !done_ref.load(Ordering::Relaxed) {
+                    for i in 0..1000u64 {
+                        let _ = tree_ref.search(i);
+                    }
+                }
+            }));
+        }
+
+        let tree_ref = tree.clone();
+        let done_ref = done.clone();
+        handles.push(thread::spawn(move || {
+            for i in 0..1000u64 {
+                tree_ref.delete(i);
+            }
+            done_ref.store(true, Ordering::Relaxed);
+        }));
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(tree.is_empty());
     }
 }

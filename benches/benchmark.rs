@@ -10,7 +10,7 @@ fn bench_search(c: &mut Criterion) {
     let mut rng = rand::thread_rng();
     let keys: Vec<u64> = (0..n).map(|_| rng.gen_range(0..100_000)).collect();
 
-    let sound_tree = BTree::<u64, u64>::new();
+    let sound_tree = BTree::new();
     for &k in &keys {
         sound_tree.insert(k, k);
     }
@@ -47,7 +47,7 @@ fn bench_insert(c: &mut Criterion) {
 
     group.bench_function("SoundBTree", |b| {
         b.iter_batched(
-            || BTree::<u64, u64>::new(),
+            || BTree::new(),
             |tree| {
                 for k in &random_keys {
                     tree.insert(black_box(*k), black_box(*k));
@@ -81,7 +81,7 @@ fn bench_incremental_insert(c: &mut Criterion) {
         let counter = AtomicU64::new(10000);
         b.iter_batched(
             || {
-                let tree = BTree::<u64, u64>::with_capacity(20_000);
+                let tree = BTree::with_capacity(20_000);
                 for i in 0..5000u64 {
                     tree.insert(i, i);
                 }
@@ -120,5 +120,99 @@ fn bench_incremental_insert(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_insert, bench_search, bench_incremental_insert);
+fn bench_delete(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Delete Operations");
+
+    let n = 1000;
+    let keys: Vec<u64> = (0..n).collect();
+
+    group.bench_function("SoundBTree", |b| {
+        b.iter_batched(
+            || {
+                let tree = BTree::new();
+                for &k in &keys {
+                    tree.insert(k, k);
+                }
+                tree
+            },
+            |tree| {
+                for &k in &keys {
+                    black_box(tree.delete(k));
+                }
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("StdBTreeMap", |b| {
+        b.iter_batched(
+            || {
+                let mut tree = BTreeMap::new();
+                for &k in &keys {
+                    tree.insert(k, k);
+                }
+                tree
+            },
+            |mut tree| {
+                for &k in &keys {
+                    black_box(tree.remove(&k));
+                }
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
+}
+
+fn bench_mixed_operations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Mixed Operations (insert/search/delete)");
+
+    let mut rng = rand::thread_rng();
+    let keys: Vec<u64> = (0..1000).map(|_| rng.gen_range(0..5000)).collect();
+
+    group.bench_function("SoundBTree", |b| {
+        b.iter_batched(
+            || {
+                let tree = BTree::new();
+                for i in 0..2500u64 {
+                    tree.insert(i, i);
+                }
+                tree
+            },
+            |tree| {
+                for &k in &keys {
+                    tree.insert(black_box(k), black_box(k));
+                    black_box(tree.search(k));
+                    tree.delete(black_box(k));
+                }
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("StdBTreeMap", |b| {
+        b.iter_batched(
+            || {
+                let mut tree = BTreeMap::new();
+                for i in 0..2500u64 {
+                    tree.insert(i, i);
+                }
+                tree
+            },
+            |mut tree| {
+                for &k in &keys {
+                    tree.insert(black_box(k), black_box(k));
+                    black_box(tree.get(&k));
+                    tree.remove(&black_box(k));
+                }
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_insert, bench_search, bench_incremental_insert, bench_delete, bench_mixed_operations);
 criterion_main!(benches);

@@ -8,7 +8,7 @@ fn main() {
     println!("=======================================================");
 
     println!("\n[Test 1] Structure Verification (Single Thread)");
-    let tree = BTree::<u64, u64>::new();
+    let tree = BTree::new();
 
     for i in 0..25u64 {
         tree.insert(i, i * 100);
@@ -23,7 +23,7 @@ fn main() {
     println!("-> Each thread inserts 2,500 items simultaneously.");
     println!("-> Total expected items: 10,000");
 
-    let shared_tree = Arc::new(BTree::<u64, u64>::new());
+    let shared_tree = Arc::new(BTree::new());
     let mut handles = vec![];
 
     for i in 0..4 {
