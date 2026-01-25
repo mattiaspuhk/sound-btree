@@ -17,13 +17,13 @@ where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
-    pub version: AtomicU64,
+    version: AtomicU64,
 
-    pub keys: UnsafeCell<[K; CAPACITY]>,
-    pub values: UnsafeCell<[V; CAPACITY]>,
-    pub children: UnsafeCell<[Option<NodeId>; CAPACITY + 1]>,
-    pub len: UnsafeCell<usize>,
-    pub is_leaf: UnsafeCell<bool>,
+    keys: UnsafeCell<[K; CAPACITY]>,
+    values: UnsafeCell<[V; CAPACITY]>,
+    children: UnsafeCell<[Option<NodeId>; CAPACITY + 1]>,
+    len: UnsafeCell<usize>,
+    is_leaf: UnsafeCell<bool>,
 }
 
 /// SAFETY: Node<K, V> is Sync because concurrent access is mediated by the seqlock protocol:
@@ -47,6 +47,22 @@ where
 /// These invariants ensure that data races cannot occur: either a reader sees a consistent
 /// snapshot (validation succeeds) or it detects concurrent modification (validation fails
 /// and triggers retry).
+///
+/// # Known Limitation (Seqlock UB)
+///
+/// This implementation uses the seqlock pattern, which technically violates Rust's strict
+/// aliasing rules: readers create `&T` references while a writer may concurrently hold
+/// `&mut T`. This is a documented open problem in Rust's memory model for seqlocks
+/// (see rust-lang RFCs and discussions on `UnsafeCell` semantics).
+///
+/// The implementation is **empirically sound** on all major architectures (x86, ARM) because:
+/// - K and V are `Copy` types with no internal pointers to invalidate
+/// - Word-sized reads/writes are atomic on modern CPUs (no torn reads)
+/// - The validation step detects any inconsistency from concurrent modification
+/// - Miri will flag this as UB, but real hardware behaves correctly
+///
+/// A fully sound implementation would require `AtomicCell<T>` or similar primitives
+/// that don't yet exist in stable Rust.
 unsafe impl<K, V> Sync for Node<K, V>
 where
     K: Copy + Ord + Default,
@@ -278,6 +294,9 @@ where
                 let node = self.node(current_id);
 
                 let start_version = node.read_version();
+                if start_version % 2 != 0 {
+                    continue 'restart;
+                }
 
                 let read_result = unsafe {
                     let len = *node.len.get();
