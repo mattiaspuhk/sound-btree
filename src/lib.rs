@@ -421,17 +421,17 @@ where
             let start_version = node.read_version();
 
             let next_step = unsafe {
-                let len = *node.len.get();
-                let keys = &*node.keys.get();
+                let len = node.read_len();
+                let is_leaf = node.read_is_leaf();
 
-                if *node.is_leaf.get() {
+                if is_leaf {
                     Err(())
                 } else {
-                    let idx = match keys[0..len].binary_search(&key) {
+                    let idx = match node.binary_search_raw(&key, len) {
                         Ok(i) => i + 1,
                         Err(i) => i,
                     };
-                    Ok((*node.children.get())[idx].unwrap())
+                    Ok(node.read_child(idx).unwrap())
                 }
             };
 
@@ -444,8 +444,19 @@ where
                 Err(_) => {
                     node.write_lock();
 
-                    let is_full = unsafe { *node.len.get() >= CAPACITY };
+                    let current_version = node.version.load(Ordering::Relaxed);
+                    if current_version != start_version + 1 {
+                        node.write_unlock();
+                        return Some(false);
+                    }
 
+                    let is_leaf = unsafe { *node.is_leaf.get() };
+                    if !is_leaf {
+                        node.write_unlock();
+                        return Some(false);
+                    }
+
+                    let is_full = unsafe { *node.len.get() >= CAPACITY };
                     if is_full {
                         node.write_unlock();
                         return None;
