@@ -129,6 +129,56 @@ where
     pub fn write_unlock(&self) {
         self.version.fetch_add(1, Ordering::Release);
     }
+
+    #[inline]
+    unsafe fn read_len(&self) -> usize {
+        unsafe { std::ptr::read_volatile(self.len.get()) }
+    }
+
+    #[inline]
+    unsafe fn read_is_leaf(&self) -> bool {
+        unsafe { std::ptr::read_volatile(self.is_leaf.get()) }
+    }
+
+    #[inline]
+    unsafe fn read_key(&self, idx: usize) -> K {
+        unsafe {
+            let ptr = self.keys.get() as *const K;
+            std::ptr::read_volatile(ptr.add(idx))
+        }
+    }
+
+    #[inline]
+    unsafe fn read_value(&self, idx: usize) -> V {
+        unsafe {
+            let ptr = self.values.get() as *const V;
+            std::ptr::read_volatile(ptr.add(idx))
+        }
+    }
+
+    #[inline]
+    unsafe fn read_child(&self, idx: usize) -> Option<NodeId> {
+        unsafe {
+            let ptr = self.children.get() as *const Option<NodeId>;
+            std::ptr::read_volatile(ptr.add(idx))
+        }
+    }
+
+    #[inline]
+    unsafe fn binary_search_raw(&self, key: &K, len: usize) -> Result<usize, usize> {
+        let mut left = 0;
+        let mut right = len;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let mid_key = unsafe { self.read_key(mid) };
+            match mid_key.cmp(key) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Greater => right = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(left)
+    }
 }
 
 pub struct BTree<K, V>
