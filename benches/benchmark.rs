@@ -3,6 +3,8 @@ use rand::prelude::*;
 use sound_btree::BTree;
 use std::collections::BTreeMap;
 
+type SoundBTree = BTree<u64, u64>;
+
 fn bench_search(c: &mut Criterion) {
     let mut group = c.benchmark_group("Search Operations");
 
@@ -10,7 +12,7 @@ fn bench_search(c: &mut Criterion) {
     let mut rng = rand::thread_rng();
     let keys: Vec<u64> = (0..n).map(|_| rng.gen_range(0..100_000)).collect();
 
-    let sound_tree = BTree::new();
+    let sound_tree: SoundBTree = BTree::new();
     for &k in &keys {
         sound_tree.insert(k, k);
     }
@@ -47,7 +49,7 @@ fn bench_insert(c: &mut Criterion) {
 
     group.bench_function("SoundBTree", |b| {
         b.iter_batched(
-            || BTree::new(),
+            || -> SoundBTree { BTree::new() },
             |tree| {
                 for k in &random_keys {
                     tree.insert(black_box(*k), black_box(*k));
@@ -81,7 +83,7 @@ fn bench_incremental_insert(c: &mut Criterion) {
         let counter = AtomicU64::new(10000);
         b.iter_batched(
             || {
-                let tree = BTree::with_capacity(20_000);
+                let tree: SoundBTree = BTree::with_capacity(20_000);
                 for i in 0..5000u64 {
                     tree.insert(i, i);
                 }
@@ -129,7 +131,7 @@ fn bench_delete(c: &mut Criterion) {
     group.bench_function("SoundBTree", |b| {
         b.iter_batched(
             || {
-                let tree = BTree::new();
+                let tree: SoundBTree = BTree::new();
                 for &k in &keys {
                     tree.insert(k, k);
                 }
@@ -174,7 +176,7 @@ fn bench_mixed_operations(c: &mut Criterion) {
     group.bench_function("SoundBTree", |b| {
         b.iter_batched(
             || {
-                let tree = BTree::new();
+                let tree: SoundBTree = BTree::new();
                 for i in 0..2500u64 {
                     tree.insert(i, i);
                 }
