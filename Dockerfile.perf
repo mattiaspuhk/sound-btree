@@ -1,5 +1,0 @@
-FROM rust:latest
-RUN apt-get update && apt-get install -y valgrind
-WORKDIR /app
-COPY . .
-RUN cargo build --release
