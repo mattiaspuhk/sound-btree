@@ -431,7 +431,7 @@ where
                         Ok(i) => i + 1,
                         Err(i) => i,
                     };
-                    Ok(node.read_child(idx).unwrap())
+                    Ok(node.read_child(idx).expect("child must exist at search index"))
                 }
             };
 
@@ -581,7 +581,7 @@ where
                 let go_right = unsafe { key > (*keys_ptr)[idx] };
 
                 if go_right {
-                    let right_id = unsafe { (*children_ptr)[idx + 1].unwrap() };
+                    let right_id = unsafe { (*children_ptr)[idx + 1].expect("right child must exist after split") };
                     node.write_unlock();
                     self.insert_pessimistic_non_full(right_id, key, value);
                 } else {
@@ -599,7 +599,7 @@ where
     fn split_child(&self, parent_id: NodeId, child_idx: usize) {
         let parent = self.node(parent_id);
 
-        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
+        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist at split index") };
         let child = self.node(child_id);
 
         let (mid_key, mid_val, right_id) = self.allocate_and_distribute(child_id);
@@ -767,7 +767,7 @@ where
             let len = *root.len.get();
             let is_leaf = *root.is_leaf.get();
             if len == 0 && !is_leaf {
-                (true, (*root.children.get())[0].unwrap())
+                (true, (*root.children.get())[0].expect("internal node must have child"))
             } else {
                 (false, root_id)
             }
@@ -820,7 +820,7 @@ where
     fn ensure_child_can_lose_key(&self, parent_id: NodeId, child_idx: usize) -> NodeId {
         let parent = self.node(parent_id);
 
-        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
+        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
         let child = self.node(child_id);
         child.write_lock();
 
@@ -834,7 +834,7 @@ where
         let parent_len = unsafe { *parent.len.get() };
 
         if child_idx > 0 {
-            let left_id = unsafe { (*parent.children.get())[child_idx - 1].unwrap() };
+            let left_id = unsafe { (*parent.children.get())[child_idx - 1].expect("left sibling must exist") };
             let left = self.node(left_id);
             left.write_lock();
 
@@ -853,7 +853,7 @@ where
         }
 
         if child_idx < parent_len {
-            let right_id = unsafe { (*parent.children.get())[child_idx + 1].unwrap() };
+            let right_id = unsafe { (*parent.children.get())[child_idx + 1].expect("right sibling must exist") };
             let right = self.node(right_id);
             right.write_lock();
 
@@ -877,8 +877,8 @@ where
 
     fn borrow_from_left(&self, parent_id: NodeId, child_idx: usize) {
         let parent = self.node(parent_id);
-        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
-        let left_id = unsafe { (*parent.children.get())[child_idx - 1].unwrap() };
+        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
+        let left_id = unsafe { (*parent.children.get())[child_idx - 1].expect("left sibling must exist") };
 
         let child = self.node(child_id);
         let left = self.node(left_id);
@@ -920,8 +920,8 @@ where
 
     fn borrow_from_right(&self, parent_id: NodeId, child_idx: usize) {
         let parent = self.node(parent_id);
-        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
-        let right_id = unsafe { (*parent.children.get())[child_idx + 1].unwrap() };
+        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
+        let right_id = unsafe { (*parent.children.get())[child_idx + 1].expect("right sibling must exist") };
 
         let child = self.node(child_id);
         let right = self.node(right_id);
@@ -963,8 +963,8 @@ where
 
     fn merge_with_left(&self, parent_id: NodeId, child_idx: usize) -> NodeId {
         let parent = self.node(parent_id);
-        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
-        let left_id = unsafe { (*parent.children.get())[child_idx - 1].unwrap() };
+        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
+        let left_id = unsafe { (*parent.children.get())[child_idx - 1].expect("left sibling must exist") };
 
         let child = self.node(child_id);
         let left = self.node(left_id);
@@ -1008,8 +1008,8 @@ where
 
     fn merge_with_right(&self, parent_id: NodeId, child_idx: usize) -> NodeId {
         let parent = self.node(parent_id);
-        let child_id = unsafe { (*parent.children.get())[child_idx].unwrap() };
-        let right_id = unsafe { (*parent.children.get())[child_idx + 1].unwrap() };
+        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
+        let right_id = unsafe { (*parent.children.get())[child_idx + 1].expect("right sibling must exist") };
 
         let child = self.node(child_id);
         let right = self.node(right_id);
