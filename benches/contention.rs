@@ -22,10 +22,28 @@ use rand::prelude::*;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::sync::Once;
 
 use sound_btree::olc_result::BTreeResult;
 use sound_btree::olc_unwind::BTreeUnwind;
 use sound_btree::BTree;
+
+// Suppress panic messages from olc_unwind (intentional panics for control flow)
+static INIT_PANIC_HOOK: Once = Once::new();
+
+fn suppress_version_mismatch_panics() {
+    INIT_PANIC_HOOK.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(location) = info.location() {
+                if location.file().contains("olc_unwind") {
+                    return;
+                }
+            }
+            default_hook(info);
+        }));
+    });
+}
 
 struct ContentionConfig {
     threads: usize,
@@ -35,6 +53,7 @@ struct ContentionConfig {
 }
 
 fn bench_high_contention(c: &mut Criterion) {
+    suppress_version_mismatch_panics();
     let mut group = c.benchmark_group("OLC High Contention");
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(5));
