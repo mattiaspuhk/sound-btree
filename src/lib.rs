@@ -26,43 +26,6 @@ where
     is_leaf: UnsafeCell<bool>,
 }
 
-/// SAFETY: Node<K, V> is Sync because concurrent access is mediated by the seqlock protocol:
-///
-/// 1. **Writers** must hold the write lock (version is odd) before accessing any `UnsafeCell`
-///    field. The lock is acquired via `write_lock()` and released via `write_unlock()`.
-///
-/// 2. **Readers** use Optimistic Lock Coupling (OLC):
-///    - Snapshot the version (must be even, meaning unlocked)
-///    - Read data from `UnsafeCell` fields
-///    - Validate that version hasn't changed
-///    - Retry the entire operation if validation fails
-///
-/// 3. **Initialization**: New nodes are fully initialized (including `is_leaf`) before
-///    their `NodeId` is made visible to other threads. The `Release` ordering on
-///    `version.store(0)` in `new_node` synchronizes with the `Acquire` on version reads.
-///
-/// 4. **Generic bounds**: K and V are required to be `Copy`, ensuring all data lives inline
-///    in the arrays (no heap pointers that could be invalidated by concurrent access).
-///
-/// These invariants ensure that data races cannot occur: either a reader sees a consistent
-/// snapshot (validation succeeds) or it detects concurrent modification (validation fails
-/// and triggers retry).
-///
-/// # Known Limitation (Seqlock UB)
-///
-/// This implementation uses the seqlock pattern, which technically violates Rust's strict
-/// aliasing rules: readers create `&T` references while a writer may concurrently hold
-/// `&mut T`. This is a documented open problem in Rust's memory model for seqlocks
-/// (see rust-lang RFCs and discussions on `UnsafeCell` semantics).
-///
-/// The implementation is **empirically sound** on all major architectures (x86, ARM) because:
-/// - K and V are `Copy` types with no internal pointers to invalidate
-/// - Word-sized reads/writes are atomic on modern CPUs (no torn reads)
-/// - The validation step detects any inconsistency from concurrent modification
-/// - Miri will flag this as UB, but real hardware behaves correctly
-///
-/// A fully sound implementation would require `AtomicCell<T>` or similar primitives
-/// that don't yet exist in stable Rust.
 unsafe impl<K, V> Sync for Node<K, V>
 where
     K: Copy + Ord + Default,
@@ -191,6 +154,7 @@ where
     released: bool,
 }
 
+#[allow(dead_code)]
 impl<'a, K, V> NodeWriteGuard<'a, K, V>
 where
     K: Copy + Ord + Default,
@@ -258,29 +222,12 @@ where
     entry_count: AtomicUsize,
 }
 
-/// SAFETY: BTree<K, V> is Sync because:
-///
-/// 1. **`pages` (UnsafeCell<Vec<Node<K, V>>>)**: The Vec itself is never resized after construction
-///    (pre-allocated arena). Individual Node access is synchronized via each Node's seqlock.
-///
-/// 2. **`next_free_idx` (AtomicUsize)**: Atomic, inherently thread-safe. Used for allocating
-///    new nodes with `fetch_add`.
-///
-/// 3. **`root_id` (AtomicU32)**: Atomic, inherently thread-safe. Root changes are protected
-///    by locking the old root before updating this field.
-///
-/// The combination of per-node seqlocks and atomic root/allocation indices ensures that
-/// concurrent operations are correctly synchronized.
 unsafe impl<K, V> Sync for BTree<K, V>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {}
 
-/// SAFETY: BTree<K, V> is Send because all its fields can be safely transferred between threads:
-/// - `pages`: Vec<Node<K, V>> where Node<K, V> is Sync (seqlock-protected)
-/// - `next_free_idx`: AtomicUsize (inherently Send)
-/// - `root_id`: AtomicU32 (inherently Send)
 unsafe impl<K, V> Send for BTree<K, V>
 where
     K: Copy + Ord + Default,
@@ -487,30 +434,27 @@ where
             match next_step {
                 Ok(child_id) => current_id = child_id,
                 Err(_) => {
-                    node.write_lock();
+                    let guard = NodeWriteGuard::new(node);
 
-                    let current_version = node.version.load(Ordering::Relaxed);
+                    let current_version = guard.version.load(Ordering::Relaxed);
                     if current_version != start_version + 1 {
-                        node.write_unlock();
                         return Some(false);
                     }
 
-                    let is_leaf = unsafe { *node.is_leaf.get() };
+                    let is_leaf = unsafe { *guard.is_leaf.get() };
                     if !is_leaf {
-                        node.write_unlock();
                         return Some(false);
                     }
 
-                    let is_full = unsafe { *node.len.get() >= CAPACITY };
+                    let is_full = unsafe { *guard.len.get() >= CAPACITY };
                     if is_full {
-                        node.write_unlock();
                         return None;
                     }
 
                     let is_new = unsafe {
-                        let len = *node.len.get();
-                        let keys = &mut *node.keys.get();
-                        let vals = &mut *node.values.get();
+                        let len = *guard.len.get();
+                        let keys = &mut *guard.keys.get();
+                        let vals = &mut *guard.values.get();
 
                         match keys[0..len].binary_search(&key) {
                             Ok(idx) => {
@@ -522,13 +466,13 @@ where
                                 vals.copy_within(idx..len, idx + 1);
                                 keys[idx] = key;
                                 vals[idx] = value;
-                                *node.len.get() += 1;
+                                *guard.len.get() += 1;
                                 true
                             }
                         }
                     };
 
-                    node.write_unlock();
+                    drop(guard);
                     if is_new {
                         self.entry_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -763,18 +707,17 @@ where
                 Ok(Some(child_id)) => current_id = child_id,
                 Ok(None) => return None,
                 Err(Some(idx)) => {
-                    node.write_lock();
+                    let guard = NodeWriteGuard::new(node);
 
-                    let current_version = node.version.load(Ordering::Relaxed);
+                    let current_version = guard.version.load(Ordering::Relaxed);
                     if current_version != start_version + 1 {
-                        node.write_unlock();
                         return None;
                     }
 
                     let can_delete = unsafe {
-                        let len = *node.len.get();
-                        let is_leaf = *node.is_leaf.get();
-                        let keys = &*node.keys.get();
+                        let len = *guard.len.get();
+                        let is_leaf = *guard.is_leaf.get();
+                        let keys = &*guard.keys.get();
                         let is_root = current_id.0 == self.root_id.load(Ordering::Relaxed);
 
                         is_leaf
@@ -783,12 +726,11 @@ where
                     };
 
                     if !can_delete {
-                        node.write_unlock();
                         return None;
                     }
 
                     let value = self.remove_from_leaf(current_id, idx);
-                    node.write_unlock();
+                    drop(guard);
                     return Some(Some(value));
                 }
                 Err(None) => {
