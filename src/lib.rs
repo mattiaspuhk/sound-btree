@@ -101,7 +101,8 @@ where
     }
 
     pub fn validate(&self, start_version: u64) -> bool {
-        let current = self.version.load(Ordering::Acquire);
+        std::sync::atomic::fence(Ordering::Acquire);
+        let current = self.version.load(Ordering::Relaxed);
         current == start_version && current % 2 == 0
     }
 
