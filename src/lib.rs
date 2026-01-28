@@ -373,20 +373,16 @@ where
                 }
 
                 let read_result = unsafe {
-                    let len = *node.len.get();
-                    let keys = &*node.keys.get();
+                    let len = node.read_len();
+                    let is_leaf = node.read_is_leaf();
 
-                    match keys[0..len].binary_search(&key) {
-                        Ok(idx) => {
-                            let values = &*node.values.get();
-                            Ok(Some(values[idx]))
-                        }
+                    match node.binary_search_raw(&key, len) {
+                        Ok(idx) => Ok(Some(node.read_value(idx))),
                         Err(idx) => {
-                            if *node.is_leaf.get() {
+                            if is_leaf {
                                 Ok(None)
                             } else {
-                                let children = &*node.children.get();
-                                Err(children[idx])
+                                Err(node.read_child(idx))
                             }
                         }
                     }
