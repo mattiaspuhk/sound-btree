@@ -692,21 +692,20 @@ where
             }
 
             let next_step = unsafe {
-                let len = *node.len.get();
-                let keys = &*node.keys.get();
-                let is_leaf = *node.is_leaf.get();
+                let len = node.read_len();
+                let is_leaf = node.read_is_leaf();
 
                 if is_leaf {
-                    match keys[0..len].binary_search(&key) {
+                    match node.binary_search_raw(&key, len) {
                         Ok(idx) => Err(Some(idx)),
                         Err(_) => Err(None),
                     }
                 } else {
-                    match keys[0..len].binary_search(&key) {
+                    match node.binary_search_raw(&key, len) {
                         Ok(_) => {
                             return None;
                         }
-                        Err(idx) => Ok((*node.children.get())[idx]),
+                        Err(idx) => Ok(node.read_child(idx)),
                     }
                 }
             };
@@ -720,6 +719,12 @@ where
                 Ok(None) => return None,
                 Err(Some(idx)) => {
                     node.write_lock();
+
+                    let current_version = node.version.load(Ordering::Relaxed);
+                    if current_version != start_version + 1 {
+                        node.write_unlock();
+                        return None;
+                    }
 
                     let can_delete = unsafe {
                         let len = *node.len.get();
