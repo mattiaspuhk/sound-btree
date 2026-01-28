@@ -4,35 +4,35 @@ use std::cell::UnsafeCell;
 use std::marker::Sync;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-const B: usize = 6;
-const CAPACITY: usize = 2 * B - 1;
-const MIN_KEYS: usize = B - 1;
+pub const DEFAULT_CAP: usize = 11;
+
+pub const DEFAULT_CHILDREN_CAP: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeId(u32);
 
 #[derive(Debug)]
-pub struct Node<K, V>
+pub struct Node<K, V, const CAP: usize = DEFAULT_CAP, const CHILDREN_CAP: usize = DEFAULT_CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
     version: AtomicU64,
 
-    keys: UnsafeCell<[K; CAPACITY]>,
-    values: UnsafeCell<[V; CAPACITY]>,
-    children: UnsafeCell<[Option<NodeId>; CAPACITY + 1]>,
+    keys: UnsafeCell<[K; CAP]>,
+    values: UnsafeCell<[V; CAP]>,
+    children: UnsafeCell<[Option<NodeId>; CHILDREN_CAP]>,
     len: UnsafeCell<usize>,
     is_leaf: UnsafeCell<bool>,
 }
 
-unsafe impl<K, V> Sync for Node<K, V>
+unsafe impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> Sync for Node<K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {}
 
-impl<K, V> Node<K, V>
+impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> Node<K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
@@ -42,9 +42,9 @@ where
             version: AtomicU64::new(0),
             len: UnsafeCell::new(0),
             is_leaf: UnsafeCell::new(is_leaf),
-            keys: UnsafeCell::new([K::default(); CAPACITY]),
-            values: UnsafeCell::new([V::default(); CAPACITY]),
-            children: UnsafeCell::new([None; CAPACITY + 1]),
+            keys: UnsafeCell::new([K::default(); CAP]),
+            values: UnsafeCell::new([V::default(); CAP]),
+            children: UnsafeCell::new([None; CHILDREN_CAP]),
         }
     }
 
@@ -53,9 +53,9 @@ where
             version: AtomicU64::new(u64::MAX),
             len: UnsafeCell::new(0),
             is_leaf: UnsafeCell::new(true),
-            keys: UnsafeCell::new([K::default(); CAPACITY]),
-            values: UnsafeCell::new([V::default(); CAPACITY]),
-            children: UnsafeCell::new([None; CAPACITY + 1]),
+            keys: UnsafeCell::new([K::default(); CAP]),
+            values: UnsafeCell::new([V::default(); CAP]),
+            children: UnsafeCell::new([None; CHILDREN_CAP]),
         }
     }
 
@@ -145,23 +145,23 @@ where
     }
 }
 
-pub struct NodeWriteGuard<'a, K, V>
+pub struct NodeWriteGuard<'a, K, V, const CAP: usize = DEFAULT_CAP, const CHILDREN_CAP: usize = DEFAULT_CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
-    node: &'a Node<K, V>,
+    node: &'a Node<K, V, CAP, CHILDREN_CAP>,
     released: bool,
 }
 
 #[allow(dead_code)]
-impl<'a, K, V> NodeWriteGuard<'a, K, V>
+impl<'a, K, V, const CAP: usize, const CHILDREN_CAP: usize> NodeWriteGuard<'a, K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
     #[inline]
-    fn new(node: &'a Node<K, V>) -> Self {
+    fn new(node: &'a Node<K, V, CAP, CHILDREN_CAP>) -> Self {
         node.write_lock();
         Self { node, released: false }
     }
@@ -175,18 +175,18 @@ where
     }
 
     #[inline]
-    fn node(&self) -> &'a Node<K, V> {
+    fn node(&self) -> &'a Node<K, V, CAP, CHILDREN_CAP> {
         self.node
     }
 
     #[inline]
-    fn into_inner(mut self) -> &'a Node<K, V> {
+    fn into_inner(mut self) -> &'a Node<K, V, CAP, CHILDREN_CAP> {
         self.released = true;
         self.node
     }
 }
 
-impl<K, V> Drop for NodeWriteGuard<'_, K, V>
+impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> Drop for NodeWriteGuard<'_, K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
@@ -198,43 +198,43 @@ where
     }
 }
 
-impl<K, V> std::ops::Deref for NodeWriteGuard<'_, K, V>
+impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> std::ops::Deref for NodeWriteGuard<'_, K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
-    type Target = Node<K, V>;
+    type Target = Node<K, V, CAP, CHILDREN_CAP>;
 
     fn deref(&self) -> &Self::Target {
         self.node
     }
 }
 
-pub struct BTree<K, V>
+pub struct BTree<K, V, const CAP: usize = DEFAULT_CAP, const CHILDREN_CAP: usize = DEFAULT_CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
-    pages: UnsafeCell<Vec<Node<K, V>>>,
+    pages: UnsafeCell<Vec<Node<K, V, CAP, CHILDREN_CAP>>>,
     next_free_idx: AtomicUsize,
     root_id: AtomicU32,
-    capacity: usize,
+    node_capacity: usize,
     entry_count: AtomicUsize,
 }
 
-unsafe impl<K, V> Sync for BTree<K, V>
+unsafe impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> Sync for BTree<K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {}
 
-unsafe impl<K, V> Send for BTree<K, V>
+unsafe impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> Send for BTree<K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {}
 
-impl<K, V> Default for BTree<K, V>
+impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> Default for BTree<K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
@@ -244,18 +244,22 @@ where
     }
 }
 
-impl<K, V> BTree<K, V>
+impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> BTree<K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
-    const DEFAULT_CAPACITY: usize = 10_000;
+    const DEFAULT_NODE_CAPACITY: usize = 10_000;
 
     pub fn new() -> Self {
-        Self::with_capacity(Self::DEFAULT_CAPACITY)
+        Self::with_node_capacity(Self::DEFAULT_NODE_CAPACITY)
     }
 
     pub fn with_capacity(max_nodes: usize) -> Self {
+        Self::with_node_capacity(max_nodes)
+    }
+
+    pub fn with_node_capacity(max_nodes: usize) -> Self {
         assert!(max_nodes >= 1, "Arena must have at least 1 node");
 
         let mut pages = Vec::with_capacity(max_nodes);
@@ -272,7 +276,7 @@ where
             pages: UnsafeCell::new(pages),
             next_free_idx: AtomicUsize::new(1),
             root_id: AtomicU32::new(0),
-            capacity: max_nodes,
+            node_capacity: max_nodes,
             entry_count: AtomicUsize::new(0),
         }
     }
@@ -307,9 +311,9 @@ where
         }
 
         unsafe {
-            *node0.keys.get() = [K::default(); CAPACITY];
-            *node0.values.get() = [V::default(); CAPACITY];
-            *node0.children.get() = [None; CAPACITY + 1];
+            *node0.keys.get() = [K::default(); CAP];
+            *node0.values.get() = [V::default(); CAP];
+            *node0.children.get() = [None; CHILDREN_CAP];
             *node0.len.get() = 0;
             *node0.is_leaf.get() = true;
         }
@@ -324,7 +328,7 @@ where
         self.node(root_id).write_unlock();
     }
 
-    fn node(&self, id: NodeId) -> &Node<K, V> {
+    fn node(&self, id: NodeId) -> &Node<K, V, CAP, CHILDREN_CAP> {
         unsafe {
             let ptr = self.pages.get();
             let slice = &*ptr;
@@ -335,16 +339,16 @@ where
     fn new_node(&self, is_leaf: bool) -> NodeId {
         let idx = self.next_free_idx.fetch_add(1, Ordering::Relaxed);
 
-        if idx >= self.capacity {
-            panic!("Arena OOM: Tree exceeded capacity of {} nodes. Use BTree::with_capacity() for larger trees.", self.capacity);
+        if idx >= self.node_capacity {
+            panic!("Arena OOM: Tree exceeded capacity of {} nodes. Use BTree::with_capacity() for larger trees.", self.node_capacity);
         }
 
         let n = self.node(NodeId(idx as u32));
 
         unsafe {
-            *n.keys.get() = [K::default(); CAPACITY];
-            *n.values.get() = [V::default(); CAPACITY];
-            *n.children.get() = [None; CAPACITY + 1];
+            *n.keys.get() = [K::default(); CAP];
+            *n.values.get() = [V::default(); CAP];
+            *n.children.get() = [None; CHILDREN_CAP];
             *n.len.get() = 0;
             *n.is_leaf.get() = is_leaf;
             n.version.store(0, Ordering::Release);
@@ -446,7 +450,7 @@ where
                         return Some(false);
                     }
 
-                    let is_full = unsafe { *guard.len.get() >= CAPACITY };
+                    let is_full = unsafe { *guard.len.get() >= CAP };
                     if is_full {
                         return None;
                     }
@@ -494,7 +498,7 @@ where
             root.write_unlock();
         };
         let root = self.node(root_id);
-        let root_full = unsafe { *root.len.get() == CAPACITY };
+        let root_full = unsafe { *root.len.get() == CAP };
 
         let current_root_id = if root_full {
             let new_root_id = self.new_node(false);
@@ -565,7 +569,7 @@ where
 
             let child = self.node(child_id);
             child.write_lock();
-            let child_full = unsafe { *child.len.get() == CAPACITY };
+            let child_full = unsafe { *child.len.get() == CAP };
 
             if child_full {
                 self.split_child(node_id, idx);
@@ -721,7 +725,7 @@ where
                         let is_root = current_id.0 == self.root_id.load(Ordering::Relaxed);
 
                         is_leaf
-                            && (len > MIN_KEYS || is_root)
+                            && (len > CAP / 2 || is_root)
                             && matches!(keys[0..len].binary_search(&key), Ok(found_idx) if found_idx == idx)
                     };
 
@@ -818,7 +822,7 @@ where
 
         let child_len = unsafe { *child.len.get() };
 
-        if child_len > MIN_KEYS {
+        if child_len > CAP / 2 {
             child.write_unlock();
             return child_id;
         }
@@ -831,7 +835,7 @@ where
             left.write_lock();
 
             let left_len = unsafe { *left.len.get() };
-            if left_len > MIN_KEYS {
+            if left_len > CAP / 2 {
                 self.borrow_from_left(parent_id, child_idx);
                 left.write_unlock();
                 child.write_unlock();
@@ -850,7 +854,7 @@ where
             right.write_lock();
 
             let right_len = unsafe { *right.len.get() };
-            if right_len > MIN_KEYS {
+            if right_len > CAP / 2 {
                 self.borrow_from_right(parent_id, child_idx);
                 right.write_unlock();
                 child.write_unlock();
