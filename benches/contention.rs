@@ -1,10 +1,4 @@
 //! High-Contention Benchmark: Result vs Unwind OLC Retry Strategies
-//!
-//! This benchmark is specifically designed to force frequent OLC validation failures
-//! by having multiple threads hammer the same small key range. Under normal usage,
-//! conflicts are rare and both approaches perform similarly. This benchmark reveals
-//! the differences.
-//!
 //! ## What We're Measuring
 //!
 //! 1. **Happy Path Performance**: When no conflicts occur, how much overhead does
@@ -20,50 +14,6 @@
 //! - **Low contention**: Both approaches similar, slight edge to Unwind (fewer branches)
 //! - **High contention**: Result wins because unwinding is ~100-1000x slower than return
 //! - **Very high contention**: The retry overhead dominates, Result significantly faster
-//!
-//! ## CPU Mechanics at Play
-//!
-//! ### Result Approach (Branch Prediction)
-//!
-//! Each `?` operator compiles to a conditional branch:
-//! ```asm
-//! test rax, rax      ; check if Result is Err
-//! jne .error_path    ; branch if error
-//! ```
-//!
-//! Modern CPUs predict branches based on history. For OLC:
-//! - Happy path (no conflict) is predicted correctly ~99%+ of the time
-//! - When mispredicted, costs ~15-20 cycles per misprediction
-//! - With N stack frames, worst case is N mispredictions on retry
-//!
-//! ### Unwind Approach (DWARF Exception Tables)
-//!
-//! Panic unwinding uses a different mechanism entirely:
-//! 1. `panic_any()` triggers the unwinding runtime
-//! 2. Runtime consults DWARF `.eh_frame` tables (or SEH on Windows)
-//! 3. For each frame, it:
-//!    - Looks up the frame's unwind info in exception tables
-//!    - Calls destructors (personality routine)
-//!    - Restores callee-saved registers
-//!    - Jumps to the next frame
-//!
-//! This is MUCH slower than returning (~microseconds vs nanoseconds) but:
-//! - Zero overhead on happy path (no branches at all)
-//! - Exception tables are only consulted when unwinding
-//!
-//! ### Net Effect
-//!
-//! | Scenario              | Result                    | Unwind                  |
-//! |-----------------------|---------------------------|-------------------------|
-//! | Happy path (1 frame)  | 1 branch                  | 0 branches              |
-//! | Happy path (N frames) | N branches                | 0 branches              |
-//! | Retry (1 frame)       | ~20 cycles                | ~1000+ cycles           |
-//! | Retry (N frames)      | ~20*N cycles              | ~1000*N cycles          |
-//!
-//! The crossover point depends on:
-//! - Tree depth (N)
-//! - Conflict rate
-//! - Branch predictor accuracy
 
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
@@ -77,48 +27,37 @@ use sound_btree::olc_result::BTreeResult;
 use sound_btree::olc_unwind::BTreeUnwind;
 use sound_btree::BTree;
 
-/// Configuration for contention benchmarks
 struct ContentionConfig {
-    /// Number of threads
     threads: usize,
-    /// Key range size (smaller = more contention)
     key_range: u64,
-    /// Ratio of writes to total operations (0.0 - 1.0)
     write_ratio: f64,
-    /// Number of operations per thread per iteration
     ops_per_thread: usize,
 }
 
-/// High contention benchmark group
 fn bench_high_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("OLC High Contention");
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(5));
 
-    // Test configurations: (threads, key_range, write_ratio)
     let configs = [
-        // Very high contention: 8 threads, 10 keys, 50% writes
         ("extreme", ContentionConfig {
             threads: 8,
             key_range: 10,
             write_ratio: 0.5,
             ops_per_thread: 100,
         }),
-        // High contention: 8 threads, 100 keys, 20% writes
         ("high", ContentionConfig {
             threads: 8,
             key_range: 100,
             write_ratio: 0.2,
             ops_per_thread: 100,
         }),
-        // Medium contention: 4 threads, 1000 keys, 10% writes
         ("medium", ContentionConfig {
             threads: 4,
             key_range: 1000,
             write_ratio: 0.1,
             ops_per_thread: 100,
         }),
-        // Low contention: 4 threads, 10000 keys, 5% writes
         ("low", ContentionConfig {
             threads: 4,
             key_range: 10000,
@@ -128,7 +67,6 @@ fn bench_high_contention(c: &mut Criterion) {
     ];
 
     for (name, config) in &configs {
-        // Pre-populate trees
         let setup_original = || {
             let tree = Arc::new(BTree::<u64, u64>::with_capacity(50_000));
             for i in 0..config.key_range {
@@ -157,7 +95,6 @@ fn bench_high_contention(c: &mut Criterion) {
             (config.threads * config.ops_per_thread) as u64,
         ));
 
-        // Benchmark Original (continue 'restart)
         group.bench_with_input(
             BenchmarkId::new("Original", name),
             config,
@@ -191,7 +128,6 @@ fn bench_high_contention(c: &mut Criterion) {
             },
         );
 
-        // Benchmark Result approach
         group.bench_with_input(
             BenchmarkId::new("Result", name),
             config,
@@ -225,7 +161,6 @@ fn bench_high_contention(c: &mut Criterion) {
             },
         );
 
-        // Benchmark Unwind approach
         group.bench_with_input(
             BenchmarkId::new("Unwind", name),
             config,
@@ -263,13 +198,11 @@ fn bench_high_contention(c: &mut Criterion) {
     group.finish();
 }
 
-/// Single-threaded search benchmark (pure happy path comparison)
 fn bench_single_thread_search(c: &mut Criterion) {
     let mut group = c.benchmark_group("OLC Single Thread Search (Happy Path)");
 
     let n = 10_000u64;
 
-    // Setup trees
     let original = BTree::<u64, u64>::with_capacity(20_000);
     let result_tree = BTreeResult::<u64, u64>::with_capacity(20_000);
     let unwind_tree = BTreeUnwind::<u64, u64>::with_capacity(20_000);
@@ -311,7 +244,6 @@ fn bench_single_thread_search(c: &mut Criterion) {
     group.finish();
 }
 
-/// Read-heavy contention (tests happy path under concurrent load)
 fn bench_read_heavy_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("OLC Read-Heavy (95% reads)");
     group.sample_size(20);
@@ -319,7 +251,7 @@ fn bench_read_heavy_contention(c: &mut Criterion) {
     let config = ContentionConfig {
         threads: 8,
         key_range: 100,
-        write_ratio: 0.05, // 5% writes
+        write_ratio: 0.05,
         ops_per_thread: 200,
     };
 

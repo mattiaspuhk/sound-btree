@@ -385,8 +385,6 @@ where
         NodeId(idx as u32)
     }
 
-    /// Public search API - loops until success.
-    /// The retry loop is ONLY here at the top level.
     pub fn search(&self, key: K) -> Option<V> {
         loop {
             match self.search_inner(key) {
@@ -396,17 +394,6 @@ where
         }
     }
 
-    /// Inner search that propagates `VersionMismatch` via `?`.
-    ///
-    /// Each `?` operator compiles to approximately:
-    /// ```ignore
-    /// match result {
-    ///     Ok(v) => v,
-    ///     Err(e) => return Err(e),
-    /// }
-    /// ```
-    ///
-    /// This is a branch that the CPU must predict on every call frame.
     #[inline]
     fn search_inner(&self, key: K) -> Result<Option<V>, VersionMismatch> {
         let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
@@ -415,7 +402,7 @@ where
             let node = self.node(current_id);
 
             let start_version = node.read_version();
-            node.check_unlocked(start_version)?; // Branch 1: is it locked?
+            node.check_unlocked(start_version)?;
 
             let read_result = unsafe {
                 let len = node.read_len();
@@ -433,32 +420,30 @@ where
                 }
             };
 
-            node.validate(start_version)?; // Branch 2: did version change?
+            node.validate(start_version)?;
 
             match read_result {
                 Ok(result) => return Ok(result),
                 Err(child_opt) => {
                     match child_opt {
                         Some(child_id) => current_id = child_id,
-                        None => return Err(VersionMismatch), // Child was None during read
+                        None => return Err(VersionMismatch),
                     }
                 }
             }
         }
     }
 
-    /// Public insert API.
     pub fn insert(&self, key: K, value: V) {
         loop {
             match self.insert_optimistic_inner(key, value) {
-                Ok(true) => return,                    // Success
-                Ok(false) => continue,                 // Retry optimistic
-                Err(VersionMismatch) => continue,      // Version mismatch, retry
+                Ok(true) => return,
+                Ok(false) => continue,
+                Err(VersionMismatch) => continue,
             }
         }
     }
 
-    /// Optimistic insert that propagates errors via Result.
     #[inline]
     fn insert_optimistic_inner(&self, key: K, value: V) -> Result<bool, VersionMismatch> {
         let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
