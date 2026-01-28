@@ -401,6 +401,10 @@ where
         }
     }
 
+    pub fn iter(&self) -> Iter<'_, K, V, CAP, CHILDREN_CAP> {
+        Iter::new(self)
+    }
+
     pub fn insert(&self, key: K, value: V) {
         if let Some(true) = self.insert_optimistic(key, value) {
             return;
@@ -1133,7 +1137,7 @@ where
     V: Copy + Default,
 {
     pub fn print(&self) {
-        println!("=== B-Tree Structure (Arena + OLC) ===");
+        println!("=== B-Tree Structure ===");
         self.print_subtree(NodeId(self.root_id.load(Ordering::Acquire)), 0);
         println!("======================================");
     }
@@ -1160,6 +1164,237 @@ where
                 }
             }
         }
+    }
+}
+
+pub struct Iter<'a, K, V, const CAP: usize = DEFAULT_CAP, const CHILDREN_CAP: usize = DEFAULT_CHILDREN_CAP>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    tree: &'a BTree<K, V, CAP, CHILDREN_CAP>,
+    stack: Vec<(NodeId, usize)>,
+    last_key: Option<K>,
+    started: bool,
+}
+
+impl<'a, K, V, const CAP: usize, const CHILDREN_CAP: usize> Iter<'a, K, V, CAP, CHILDREN_CAP>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    fn new(tree: &'a BTree<K, V, CAP, CHILDREN_CAP>) -> Self {
+        Self {
+            tree,
+            stack: Vec::with_capacity(16),
+            last_key: None,
+            started: false,
+        }
+    }
+
+    fn descend_left(&mut self, start: NodeId) -> bool {
+        let mut current = start;
+        loop {
+            let node = self.tree.node(current);
+            let version = node.read_version();
+            if version % 2 != 0 {
+                return false;
+            }
+
+            let is_leaf = unsafe { node.read_is_leaf() };
+
+            if !node.validate(version) {
+                return false;
+            }
+
+            self.stack.push((current, 0));
+
+            if is_leaf {
+                return true;
+            }
+
+            let version = node.read_version();
+            if version % 2 != 0 {
+                return false;
+            }
+
+            let child = unsafe { node.read_child(0) };
+
+            if !node.validate(version) {
+                return false;
+            }
+
+            match child {
+                Some(id) => current = id,
+                None => return true,
+            }
+        }
+    }
+
+    fn seek_after(&mut self, key: K) -> bool {
+        self.stack.clear();
+        let root_id = NodeId(self.tree.root_id.load(Ordering::Acquire));
+        let mut current = root_id;
+
+        loop {
+            let node = self.tree.node(current);
+            let version = node.read_version();
+            if version % 2 != 0 {
+                return false;
+            }
+
+            let len = unsafe { node.read_len() };
+            let is_leaf = unsafe { node.read_is_leaf() };
+
+            let idx = unsafe {
+                match node.binary_search_raw(&key, len) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                }
+            };
+
+            if !node.validate(version) {
+                return false;
+            }
+
+            self.stack.push((current, idx));
+
+            if is_leaf {
+                return true;
+            }
+
+            let version = node.read_version();
+            if version % 2 != 0 {
+                return false;
+            }
+
+            let child = unsafe { node.read_child(idx) };
+
+            if !node.validate(version) {
+                return false;
+            }
+
+            match child {
+                Some(id) => current = id,
+                None => return true,
+            }
+        }
+    }
+
+    fn restart_from_last_key(&mut self) {
+        self.stack.clear();
+    }
+}
+
+impl<'a, K, V, const CAP: usize, const CHILDREN_CAP: usize> Iterator for Iter<'a, K, V, CAP, CHILDREN_CAP>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        'restart: loop {
+            if !self.started || self.stack.is_empty() {
+                self.started = true;
+
+                if let Some(last) = self.last_key {
+
+                    if !self.seek_after(last) {
+                        continue 'restart;
+                    }
+                } else {
+                    let root_id = NodeId(self.tree.root_id.load(Ordering::Acquire));
+                    if !self.descend_left(root_id) {
+                        continue 'restart;
+                    }
+                }
+            }
+
+            while let Some((node_id, idx)) = self.stack.last_mut() {
+                let node = self.tree.node(*node_id);
+                let version = node.read_version();
+                if version % 2 != 0 {
+                    self.restart_from_last_key();
+                    continue 'restart;
+                }
+
+                let len = unsafe { node.read_len() };
+                let is_leaf = unsafe { node.read_is_leaf() };
+
+                if !node.validate(version) {
+                    self.restart_from_last_key();
+                    continue 'restart;
+                }
+
+                if *idx < len {
+                    let version = node.read_version();
+                    if version % 2 != 0 {
+                        self.restart_from_last_key();
+                        continue 'restart;
+                    }
+
+                    let k = unsafe { node.read_key(*idx) };
+                    let v = unsafe { node.read_value(*idx) };
+
+                    if !node.validate(version) {
+                        self.restart_from_last_key();
+                        continue 'restart;
+                    }
+
+                    if let Some(last) = self.last_key {
+                        if k <= last {
+                            self.restart_from_last_key();
+                            continue 'restart;
+                        }
+                    }
+
+                    *idx += 1;
+                    self.last_key = Some(k);
+
+                    if !is_leaf && *idx <= len {
+                        let version = node.read_version();
+                        if version % 2 != 0 {
+                            self.restart_from_last_key();
+                            continue 'restart;
+                        }
+
+                        let child = unsafe { node.read_child(*idx) };
+
+                        if !node.validate(version) {
+                            self.restart_from_last_key();
+                            continue 'restart;
+                        }
+
+                        if let Some(child_id) = child {
+                            if !self.descend_left(child_id) {
+                                self.restart_from_last_key();
+                                continue 'restart;
+                            }
+                        }
+                    }
+
+                    return Some((k, v));
+                } else {
+                    self.stack.pop();
+                }
+            }
+
+            return None;
+        }
+    }
+}
+
+impl<'a, K, V, const CAP: usize, const CHILDREN_CAP: usize> IntoIterator for &'a BTree<K, V, CAP, CHILDREN_CAP>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    type Item = (K, V);
+    type IntoIter = Iter<'a, K, V, CAP, CHILDREN_CAP>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -1557,5 +1792,99 @@ mod tests {
         }
 
         assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_iter_empty() {
+        let tree = BTree::<u64, u64>::new();
+        assert_eq!(tree.iter().count(), 0);
+    }
+
+    #[test]
+    fn test_iter_single() {
+        let tree = BTree::<u64, u64>::new();
+        tree.insert(42, 420);
+
+        let items: Vec<_> = tree.iter().collect();
+        assert_eq!(items, vec![(42, 420)]);
+    }
+
+    #[test]
+    fn test_iter_ordered() {
+        let tree = BTree::<u64, u64>::new();
+
+        tree.insert(50, 500);
+        tree.insert(20, 200);
+        tree.insert(80, 800);
+        tree.insert(10, 100);
+        tree.insert(30, 300);
+
+        let items: Vec<_> = tree.iter().collect();
+        assert_eq!(items, vec![
+            (10, 100),
+            (20, 200),
+            (30, 300),
+            (50, 500),
+            (80, 800),
+        ]);
+    }
+
+    #[test]
+    fn test_iter_large() {
+        let tree = BTree::<u64, u64>::new();
+
+        for i in (0..1000u64).rev() {
+            tree.insert(i, i * 10);
+        }
+
+        let items: Vec<_> = tree.iter().collect();
+        assert_eq!(items.len(), 1000);
+
+        for (idx, (k, v)) in items.iter().enumerate() {
+            assert_eq!(*k, idx as u64);
+            assert_eq!(*v, idx as u64 * 10);
+        }
+    }
+
+    #[test]
+    fn test_iter_for_loop() {
+        let tree = BTree::<u64, u64>::new();
+        for i in 0..10u64 {
+            tree.insert(i, i * 100);
+        }
+
+        let mut count = 0;
+        for (k, v) in &tree {
+            assert_eq!(v, k * 100);
+            count += 1;
+        }
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn test_iter_concurrent_read() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tree = Arc::new(BTree::<u64, u64>::new());
+        for i in 0..1000u64 {
+            tree.insert(i, i * 10);
+        }
+
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let tree_ref = tree.clone();
+            handles.push(thread::spawn(move || {
+                let items: Vec<_> = tree_ref.iter().collect();
+                assert_eq!(items.len(), 1000);
+                for i in 1..items.len() {
+                    assert!(items[i].0 > items[i - 1].0);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
