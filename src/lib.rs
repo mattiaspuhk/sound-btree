@@ -1,5 +1,8 @@
 #![allow(clippy::manual_is_multiple_of)]
 
+pub mod olc_result;
+pub mod olc_unwind;
+
 use std::cell::UnsafeCell;
 use std::marker::Sync;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -8,15 +11,48 @@ pub const DEFAULT_CAP: usize = 11;
 
 pub const DEFAULT_CHILDREN_CAP: usize = 12;
 
+/// Identifies a node within the B-tree's arena allocator.
+///
+/// Node IDs are indices into the pre-allocated node vector. They remain valid
+/// for the lifetime of the BTree. Deleted nodes are not recycled (see Memory
+/// Reclamation section in BTree docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeId(u32);
 
+/// A node in the concurrent B-tree using Optimistic Lock Coupling (OLC).
+///
+/// # Thread Safety
+///
+/// `Node` is `Sync` despite containing `UnsafeCell` because thread-safe access
+/// is guaranteed by the OLC protocol:
+///
+/// 1. **Writers** must acquire the write lock (making version odd) before
+///    mutating any data. All writes use raw pointer operations to avoid
+///    creating Rust references that could conflict with concurrent readers.
+///
+/// 2. **Readers** perform optimistic reads without locks:
+///    - Read the version (must be even, meaning unlocked)
+///    - Read data using `read_volatile` via raw pointers
+///    - Validate that version hasn't changed
+///    - Restart if validation fails
+///
+/// 3. **Synchronization** is provided by atomic operations on `version`:
+///    - Writers use `Release` ordering when unlocking
+///    - Readers use `Acquire` ordering when reading version
+///    - An `Acquire` fence before validation ensures all reads complete
+///
+/// # Memory Model
+///
+/// - Even version: Node is unlocked and data is consistent
+/// - Odd version: Node is locked; a write is in progress
+/// - u64::MAX (odd): Uninitialized node; will be skipped by readers
 #[derive(Debug)]
 pub struct Node<K, V, const CAP: usize = DEFAULT_CAP, const CHILDREN_CAP: usize = DEFAULT_CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
+    /// Version counter for OLC. Even = unlocked, odd = locked.
     version: AtomicU64,
 
     keys: UnsafeCell<[K; CAP]>,
@@ -26,6 +62,12 @@ where
     is_leaf: UnsafeCell<bool>,
 }
 
+// SAFETY: Node is Sync because the OLC protocol ensures safe concurrent access:
+// - Writers hold an exclusive lock (odd version) before mutating
+// - Readers use raw pointers (no references) and validate version after reading
+// - Atomic operations on `version` provide the necessary synchronization
+// - All data access through UnsafeCell uses raw pointers, never Rust references
+//   during concurrent access, avoiding Stacked Borrows violations
 unsafe impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> Sync for Node<K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
@@ -59,16 +101,39 @@ where
         }
     }
 
+    /// Reads the current version with Acquire ordering.
+    ///
+    /// Used at the start of an optimistic read to establish a synchronization
+    /// point with any prior Release operations (i.e., write unlocks).
     pub fn read_version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
     }
 
+    /// Validates that the node hasn't been modified since `start_version`.
+    ///
+    /// Returns `true` if the version is unchanged AND the node is unlocked (even).
+    /// The Acquire fence ensures all prior reads in this thread complete before
+    /// we check the version, preventing the compiler from reordering reads past
+    /// the validation.
+    ///
+    /// # OLC Protocol
+    ///
+    /// Typical usage:
+    /// 1. `let v = node.read_version()` (Acquire)
+    /// 2. Check `v % 2 == 0` (skip if locked)
+    /// 3. Read data via raw pointers
+    /// 4. `node.validate(v)` → restart if false
     pub fn validate(&self, start_version: u64) -> bool {
         std::sync::atomic::fence(Ordering::Acquire);
         let current = self.version.load(Ordering::Relaxed);
         current == start_version && current % 2 == 0
     }
 
+    /// Acquires the write lock using compare-and-swap with exponential backoff.
+    ///
+    /// Spins until the version is even (unlocked) and we successfully increment
+    /// it to odd. Uses Acquire ordering on success to synchronize with prior
+    /// Release operations.
     pub fn write_lock(&self) {
         let mut backoff = 0;
         loop {
@@ -90,6 +155,10 @@ where
         }
     }
 
+    /// Releases the write lock by incrementing version from odd to even.
+    ///
+    /// Uses Release ordering to ensure all prior writes in this thread are
+    /// visible to subsequent Acquire operations (readers checking the version).
     pub fn write_unlock(&self) {
         self.version.fetch_add(1, Ordering::Release);
     }
@@ -128,6 +197,199 @@ where
         }
     }
 
+    // === Raw pointer write helpers ===
+    // These avoid creating Rust references, preventing Stacked Borrows conflicts
+    // with concurrent optimistic readers using raw pointer reads.
+
+    /// Writes a key at the given index using raw pointers.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock and ensure idx < CAP.
+    #[inline]
+    unsafe fn write_key(&self, idx: usize, key: K) {
+        unsafe {
+            let ptr = self.keys.get() as *mut K;
+            std::ptr::write(ptr.add(idx), key);
+        }
+    }
+
+    /// Writes a value at the given index using raw pointers.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock and ensure idx < CAP.
+    #[inline]
+    unsafe fn write_value(&self, idx: usize, value: V) {
+        unsafe {
+            let ptr = self.values.get() as *mut V;
+            std::ptr::write(ptr.add(idx), value);
+        }
+    }
+
+    /// Writes a child pointer at the given index using raw pointers.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock and ensure idx < CHILDREN_CAP.
+    #[inline]
+    unsafe fn write_child(&self, idx: usize, child: Option<NodeId>) {
+        unsafe {
+            let ptr = self.children.get() as *mut Option<NodeId>;
+            std::ptr::write(ptr.add(idx), child);
+        }
+    }
+
+    /// Writes the length using raw pointers.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock.
+    #[inline]
+    unsafe fn write_len(&self, len: usize) {
+        unsafe {
+            std::ptr::write(self.len.get(), len);
+        }
+    }
+
+    /// Shifts keys right by one position starting at `start` for `count` elements.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock and ensure start + count < CAP.
+    #[inline]
+    unsafe fn shift_keys_right(&self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = self.keys.get() as *mut K;
+            std::ptr::copy(ptr.add(start), ptr.add(start + 1), count);
+        }
+    }
+
+    /// Shifts values right by one position starting at `start` for `count` elements.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock and ensure start + count < CAP.
+    #[inline]
+    unsafe fn shift_values_right(&self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = self.values.get() as *mut V;
+            std::ptr::copy(ptr.add(start), ptr.add(start + 1), count);
+        }
+    }
+
+    /// Shifts children right by one position starting at `start` for `count` elements.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock and ensure start + count < CHILDREN_CAP.
+    #[inline]
+    unsafe fn shift_children_right(&self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = self.children.get() as *mut Option<NodeId>;
+            std::ptr::copy(ptr.add(start), ptr.add(start + 1), count);
+        }
+    }
+
+    /// Shifts keys left by one position, overwriting the element at `start`.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock and ensure start + count <= CAP.
+    #[inline]
+    unsafe fn shift_keys_left(&self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = self.keys.get() as *mut K;
+            std::ptr::copy(ptr.add(start + 1), ptr.add(start), count);
+        }
+    }
+
+    /// Shifts values left by one position, overwriting the element at `start`.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock and ensure start + count <= CAP.
+    #[inline]
+    unsafe fn shift_values_left(&self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = self.values.get() as *mut V;
+            std::ptr::copy(ptr.add(start + 1), ptr.add(start), count);
+        }
+    }
+
+    /// Shifts children left by one position, overwriting the element at `start`.
+    ///
+    /// # Safety
+    /// Caller must hold the write lock and ensure start + count <= CHILDREN_CAP.
+    #[inline]
+    unsafe fn shift_children_left(&self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let ptr = self.children.get() as *mut Option<NodeId>;
+            std::ptr::copy(ptr.add(start + 1), ptr.add(start), count);
+        }
+    }
+
+    /// Copies keys from another node using raw pointers.
+    ///
+    /// # Safety
+    /// Caller must hold write locks on both nodes and ensure ranges are valid.
+    #[inline]
+    unsafe fn copy_keys_from(&self, dst_start: usize, src: &Self, src_start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let src_ptr = src.keys.get() as *const K;
+            let dst_ptr = self.keys.get() as *mut K;
+            std::ptr::copy_nonoverlapping(src_ptr.add(src_start), dst_ptr.add(dst_start), count);
+        }
+    }
+
+    /// Copies values from another node using raw pointers.
+    ///
+    /// # Safety
+    /// Caller must hold write locks on both nodes and ensure ranges are valid.
+    #[inline]
+    unsafe fn copy_values_from(&self, dst_start: usize, src: &Self, src_start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let src_ptr = src.values.get() as *const V;
+            let dst_ptr = self.values.get() as *mut V;
+            std::ptr::copy_nonoverlapping(src_ptr.add(src_start), dst_ptr.add(dst_start), count);
+        }
+    }
+
+    /// Copies children from another node using raw pointers.
+    ///
+    /// # Safety
+    /// Caller must hold write locks on both nodes and ensure ranges are valid.
+    #[inline]
+    unsafe fn copy_children_from(&self, dst_start: usize, src: &Self, src_start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        unsafe {
+            let src_ptr = src.children.get() as *const Option<NodeId>;
+            let dst_ptr = self.children.get() as *mut Option<NodeId>;
+            std::ptr::copy_nonoverlapping(src_ptr.add(src_start), dst_ptr.add(dst_start), count);
+        }
+    }
+
+    /// Binary search using raw pointers. Returns Ok(idx) if found, Err(idx) for insertion point.
+    ///
+    /// # Safety
+    /// Caller must ensure len is valid and either hold write lock or be in OLC read phase.
     #[inline]
     unsafe fn binary_search_raw(&self, key: &K, len: usize) -> Result<usize, usize> {
         let mut left = 0;
@@ -210,24 +472,65 @@ where
     }
 }
 
+/// A concurrent B-tree using Optimistic Lock Coupling (OLC).
+///
+/// This B-tree provides thread-safe concurrent reads and writes without global
+/// locks. Reads are optimistic (lock-free under low contention), while writes
+/// use fine-grained per-node locking.
+///
+/// # Performance Characteristics
+///
+/// - **Reads**: Lock-free traversal with version validation. Restarts on conflict.
+/// - **Writes**: Per-node spin locks with exponential backoff.
+/// - **Memory**: Pre-allocated arena; no dynamic allocation during operations.
+///
+/// # Memory Reclamation
+///
+/// **This implementation does NOT recycle deleted nodes.** The arena grows
+/// monotonically until `clear()` is called or the tree is dropped. This is a
+/// deliberate safety constraint: recycling nodes without epoch-based reclamation
+/// (EBR) or hazard pointers would cause data races with concurrent readers.
+///
+/// For applications requiring memory reclamation, consider wrapping with
+/// `crossbeam-epoch` or implementing a quiescence protocol.
+///
+/// # Type Constraints
+///
+/// Keys and values must be `Copy` because the OLC protocol requires reading data
+/// without holding locks. Non-Copy types would require additional synchronization
+/// to prevent use-after-free during concurrent access.
 pub struct BTree<K, V, const CAP: usize = DEFAULT_CAP, const CHILDREN_CAP: usize = DEFAULT_CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {
+    /// Pre-allocated arena of nodes. Never resized after construction.
     pages: UnsafeCell<Vec<Node<K, V, CAP, CHILDREN_CAP>>>,
+    /// Next free index for allocation. Monotonically increasing.
     next_free_idx: AtomicUsize,
+    /// Current root node ID.
     root_id: AtomicU32,
+    /// Maximum number of nodes (fixed at construction).
     node_capacity: usize,
+    /// Number of key-value pairs in the tree.
     entry_count: AtomicUsize,
 }
 
+// SAFETY: BTree is Sync because:
+// 1. The `pages` Vec is never resized after construction (pre-allocated arena)
+// 2. Individual nodes are Sync due to the OLC protocol
+// 3. Atomic fields (`next_free_idx`, `root_id`, `entry_count`) are inherently Sync
+// 4. Access to `pages` only yields `&Node` references, which are safe to share
 unsafe impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> Sync for BTree<K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
     V: Copy + Default,
 {}
 
+// SAFETY: BTree is Send because:
+// 1. All fields are either Sync (atomics) or owned (Vec behind UnsafeCell)
+// 2. The UnsafeCell<Vec> can be sent between threads since we maintain
+//    exclusive ownership semantics via the OLC protocol
 unsafe impl<K, V, const CAP: usize, const CHILDREN_CAP: usize> Send for BTree<K, V, CAP, CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
@@ -293,6 +596,15 @@ where
         self.search(key).is_some()
     }
 
+    /// Clears all entries from the tree, resetting it to an empty state.
+    ///
+    /// # Memory Reclamation
+    ///
+    /// This implementation does NOT recycle node indices. Previously allocated
+    /// nodes become unreachable but their memory is not reused. This is a
+    /// deliberate safety constraint: recycling indices without epoch-based
+    /// reclamation (EBR) or hazard pointers would cause data races with
+    /// concurrent readers still traversing the old tree structure.
     pub fn clear(&self) {
         let root_id = loop {
             let root_id = NodeId(self.root_id.load(Ordering::Acquire));
@@ -310,16 +622,20 @@ where
             node0.write_lock();
         }
 
+        // SAFETY: We hold write locks on both the current root and node0.
         unsafe {
-            *node0.keys.get() = [K::default(); CAP];
-            *node0.values.get() = [V::default(); CAP];
-            *node0.children.get() = [None; CHILDREN_CAP];
-            *node0.len.get() = 0;
-            *node0.is_leaf.get() = true;
+            let keys_ptr = node0.keys.get();
+            let vals_ptr = node0.values.get();
+            let children_ptr = node0.children.get();
+
+            std::ptr::write(keys_ptr, [K::default(); CAP]);
+            std::ptr::write(vals_ptr, [V::default(); CAP]);
+            std::ptr::write(children_ptr, [None; CHILDREN_CAP]);
+            std::ptr::write(node0.len.get(), 0);
+            std::ptr::write(node0.is_leaf.get(), true);
         }
 
         self.entry_count.store(0, Ordering::Relaxed);
-        self.next_free_idx.store(1, Ordering::Relaxed);
         self.root_id.store(0, Ordering::Release);
 
         if root_id.0 != 0 {
@@ -328,7 +644,19 @@ where
         self.node(root_id).write_unlock();
     }
 
+    /// Returns a reference to the node at the given ID.
+    ///
+    /// # Safety Justification
+    ///
+    /// This is safe because:
+    /// 1. The `pages` Vec is pre-allocated and never resized (stable addresses)
+    /// 2. `NodeId` values are only created by `new_node()` with valid indices
+    /// 3. Creating `&Node` only borrows the Node struct, not the UnsafeCell contents
+    /// 4. Multiple `&Node` references can coexist safely; interior mutability is
+    ///    handled by the OLC protocol within each node
     fn node(&self, id: NodeId) -> &Node<K, V, CAP, CHILDREN_CAP> {
+        // SAFETY: pages is never resized after construction, and id.0 is always
+        // a valid index (allocated by new_node or 0 for the initial root).
         unsafe {
             let ptr = self.pages.get();
             let slice = &*ptr;
@@ -337,7 +665,7 @@ where
     }
 
     fn new_node(&self, is_leaf: bool) -> NodeId {
-        let idx = self.next_free_idx.fetch_add(1, Ordering::Relaxed);
+        let idx = self.next_free_idx.fetch_add(1, Ordering::AcqRel);
 
         if idx >= self.node_capacity {
             panic!("Arena OOM: Tree exceeded capacity of {} nodes. Use BTree::with_capacity() for larger trees.", self.node_capacity);
@@ -345,12 +673,16 @@ where
 
         let n = self.node(NodeId(idx as u32));
 
+        // SAFETY: This node index was just atomically claimed by us. The node starts
+        // with version = u64::MAX (odd), so optimistic readers will skip it. We
+        // initialize the data and then set version to 0 with Release ordering to
+        // ensure the initialization is visible before any reader could see this node.
         unsafe {
-            *n.keys.get() = [K::default(); CAP];
-            *n.values.get() = [V::default(); CAP];
-            *n.children.get() = [None; CHILDREN_CAP];
-            *n.len.get() = 0;
-            *n.is_leaf.get() = is_leaf;
+            std::ptr::write(n.keys.get(), [K::default(); CAP]);
+            std::ptr::write(n.values.get(), [V::default(); CAP]);
+            std::ptr::write(n.children.get(), [None; CHILDREN_CAP]);
+            std::ptr::write(n.len.get(), 0);
+            std::ptr::write(n.is_leaf.get(), is_leaf);
             n.version.store(0, Ordering::Release);
         }
         NodeId(idx as u32)
@@ -449,32 +781,33 @@ where
                         return Some(false);
                     }
 
-                    let is_leaf = unsafe { *guard.is_leaf.get() };
+                    // SAFETY: We hold the write lock (guard).
+                    let is_leaf = unsafe { guard.read_is_leaf() };
                     if !is_leaf {
                         return Some(false);
                     }
 
-                    let is_full = unsafe { *guard.len.get() >= CAP };
+                    // SAFETY: We hold the write lock (guard).
+                    let is_full = unsafe { guard.read_len() >= CAP };
                     if is_full {
                         return None;
                     }
 
+                    // SAFETY: We hold the write lock (guard).
                     let is_new = unsafe {
-                        let len = *guard.len.get();
-                        let keys = &mut *guard.keys.get();
-                        let vals = &mut *guard.values.get();
+                        let len = guard.read_len();
 
-                        match keys[0..len].binary_search(&key) {
+                        match guard.binary_search_raw(&key, len) {
                             Ok(idx) => {
-                                vals[idx] = value;
+                                guard.write_value(idx, value);
                                 false
                             }
                             Err(idx) => {
-                                keys.copy_within(idx..len, idx + 1);
-                                vals.copy_within(idx..len, idx + 1);
-                                keys[idx] = key;
-                                vals[idx] = value;
-                                *guard.len.get() += 1;
+                                guard.shift_keys_right(idx, len - idx);
+                                guard.shift_values_right(idx, len - idx);
+                                guard.write_key(idx, key);
+                                guard.write_value(idx, value);
+                                guard.write_len(len + 1);
                                 true
                             }
                         }
@@ -502,14 +835,16 @@ where
             root.write_unlock();
         };
         let root = self.node(root_id);
-        let root_full = unsafe { *root.len.get() == CAP };
+        // SAFETY: We hold the write lock on the root node.
+        let root_full = unsafe { root.read_len() == CAP };
 
         let current_root_id = if root_full {
             let new_root_id = self.new_node(false);
             let new_root = self.node(new_root_id);
 
+            // SAFETY: new_root was just allocated and is not yet visible to other threads.
             unsafe {
-                (*new_root.children.get())[0] = Some(root_id);
+                new_root.write_child(0, Some(root_id));
             }
 
             self.split_child(new_root_id, 0);
@@ -529,25 +864,25 @@ where
         let node = self.node(node_id);
 
         node.write_lock();
-        let is_leaf = unsafe { *node.is_leaf.get() };
+        // SAFETY: We hold the write lock on this node.
+        let is_leaf = unsafe { node.read_is_leaf() };
 
         if is_leaf {
+            // SAFETY: We hold the write lock.
             let is_new = unsafe {
-                let len = *node.len.get();
-                let keys = &mut *node.keys.get();
-                let vals = &mut *node.values.get();
+                let len = node.read_len();
 
-                match keys[0..len].binary_search(&key) {
+                match node.binary_search_raw(&key, len) {
                     Ok(idx) => {
-                        vals[idx] = value;
+                        node.write_value(idx, value);
                         false
                     }
                     Err(idx) => {
-                        keys.copy_within(idx..len, idx + 1);
-                        vals.copy_within(idx..len, idx + 1);
-                        keys[idx] = key;
-                        vals[idx] = value;
-                        *node.len.get() += 1;
+                        node.shift_keys_right(idx, len - idx);
+                        node.shift_values_right(idx, len - idx);
+                        node.write_key(idx, key);
+                        node.write_value(idx, value);
+                        node.write_len(len + 1);
                         true
                     }
                 }
@@ -557,31 +892,29 @@ where
                 self.entry_count.fetch_add(1, Ordering::Relaxed);
             }
         } else {
-            let keys_ptr = node.keys.get();
-            let children_ptr = node.children.get();
-
-            let idx = unsafe {
-                let len = *node.len.get();
-                let keys = &*keys_ptr;
-                match keys[0..len].binary_search(&key) {
+            // SAFETY: We hold the write lock on this node.
+            let (idx, child_id) = unsafe {
+                let len = node.read_len();
+                let idx = match node.binary_search_raw(&key, len) {
                     Ok(i) => i + 1,
                     Err(i) => i,
-                }
+                };
+                let child_id = node.read_child(idx).expect("Structure broken");
+                (idx, child_id)
             };
-
-            let child_id = unsafe { (*children_ptr)[idx].expect("Structure broken") };
 
             let child = self.node(child_id);
             child.write_lock();
-            let child_full = unsafe { *child.len.get() == CAP };
+            let child_full = unsafe { child.read_len() == CAP };
 
             if child_full {
                 self.split_child(node_id, idx);
 
-                let go_right = unsafe { key > (*keys_ptr)[idx] };
+                // SAFETY: After split, parent has a new key at idx.
+                let go_right = unsafe { key > node.read_key(idx) };
 
                 if go_right {
-                    let right_id = unsafe { (*children_ptr)[idx + 1].expect("right child must exist after split") };
+                    let right_id = unsafe { node.read_child(idx + 1).expect("right child must exist after split") };
                     node.write_unlock();
                     self.insert_pessimistic_non_full(right_id, key, value);
                 } else {
@@ -599,25 +932,24 @@ where
     fn split_child(&self, parent_id: NodeId, child_idx: usize) {
         let parent = self.node(parent_id);
 
-        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist at split index") };
+        // SAFETY: Caller holds write lock on parent.
+        let child_id = unsafe { parent.read_child(child_idx).expect("child must exist at split index") };
         let child = self.node(child_id);
 
         let (mid_key, mid_val, right_id) = self.allocate_and_distribute(child_id);
 
+        // SAFETY: We hold write lock on parent.
         unsafe {
-            let p_len = *parent.len.get();
-            let keys = &mut *parent.keys.get();
-            let vals = &mut *parent.values.get();
-            let children = &mut *parent.children.get();
+            let p_len = parent.read_len();
 
-            keys.copy_within(child_idx..p_len, child_idx + 1);
-            vals.copy_within(child_idx..p_len, child_idx + 1);
-            children.copy_within(child_idx + 1..p_len + 1, child_idx + 2);
+            parent.shift_keys_right(child_idx, p_len - child_idx);
+            parent.shift_values_right(child_idx, p_len - child_idx);
+            parent.shift_children_right(child_idx + 1, p_len - child_idx);
 
-            keys[child_idx] = mid_key;
-            vals[child_idx] = mid_val;
-            children[child_idx + 1] = Some(right_id);
-            *parent.len.get() += 1;
+            parent.write_key(child_idx, mid_key);
+            parent.write_value(child_idx, mid_val);
+            parent.write_child(child_idx + 1, Some(right_id));
+            parent.write_len(p_len + 1);
         }
 
         child.write_unlock();
@@ -625,36 +957,31 @@ where
 
     fn allocate_and_distribute(&self, left_id: NodeId) -> (K, V, NodeId) {
         let left = self.node(left_id);
-        let is_leaf = unsafe { *left.is_leaf.get() };
+        // SAFETY: Caller holds write lock on left node.
+        let is_leaf = unsafe { left.read_is_leaf() };
 
         let right_id = self.new_node(is_leaf);
         let right = self.node(right_id);
 
+        // SAFETY: We hold write lock on left, and right is newly allocated (not yet
+        // visible to other threads).
         let (mid_key, mid_val) = unsafe {
-            let left_len = *left.len.get();
+            let left_len = left.read_len();
             let mid = left_len / 2;
             let count = left_len - 1 - mid;
 
-            let l_keys = &mut *left.keys.get();
-            let l_vals = &mut *left.values.get();
-            let l_children = &mut *left.children.get();
-
-            let r_keys = &mut *right.keys.get();
-            let r_vals = &mut *right.values.get();
-            let r_children = &mut *right.children.get();
-
-            r_keys[0..count].copy_from_slice(&l_keys[mid + 1..mid + 1 + count]);
-            r_vals[0..count].copy_from_slice(&l_vals[mid + 1..mid + 1 + count]);
+            right.copy_keys_from(0, left, mid + 1, count);
+            right.copy_values_from(0, left, mid + 1, count);
 
             if !is_leaf {
-                r_children[0..=count].copy_from_slice(&l_children[mid + 1..mid + 2 + count]);
+                right.copy_children_from(0, left, mid + 1, count + 1);
             }
 
-            let mk = l_keys[mid];
-            let mv = l_vals[mid];
+            let mk = left.read_key(mid);
+            let mv = left.read_value(mid);
 
-            *left.len.get() = mid;
-            *right.len.get() = count;
+            left.write_len(mid);
+            right.write_len(count);
 
             (mk, mv)
         };
@@ -722,15 +1049,18 @@ where
                         return None;
                     }
 
+                    // SAFETY: We hold the write lock (guard). Using raw pointer reads.
                     let can_delete = unsafe {
-                        let len = *guard.len.get();
-                        let is_leaf = *guard.is_leaf.get();
-                        let keys = &*guard.keys.get();
+                        let len = guard.read_len();
+                        let is_leaf = guard.read_is_leaf();
                         let is_root = current_id.0 == self.root_id.load(Ordering::Relaxed);
 
-                        is_leaf
-                            && (len > CAP / 2 || is_root)
-                            && matches!(keys[0..len].binary_search(&key), Ok(found_idx) if found_idx == idx)
+                        let key_matches = matches!(
+                            guard.binary_search_raw(&key, len),
+                            Ok(found_idx) if found_idx == idx
+                        );
+
+                        is_leaf && (len > CAP / 2 || is_root) && key_matches
                     };
 
                     if !can_delete {
@@ -763,11 +1093,12 @@ where
         let result = self.delete_from_subtree(root_id, key);
 
         let root = self.node(root_id);
+        // SAFETY: We hold the write lock on root.
         let (should_shrink, new_root) = unsafe {
-            let len = *root.len.get();
-            let is_leaf = *root.is_leaf.get();
+            let len = root.read_len();
+            let is_leaf = root.read_is_leaf();
             if len == 0 && !is_leaf {
-                (true, (*root.children.get())[0].expect("internal node must have child"))
+                (true, root.read_child(0).expect("internal node must have child"))
             } else {
                 (false, root_id)
             }
@@ -784,13 +1115,10 @@ where
     fn delete_from_subtree(&self, node_id: NodeId, key: K) -> Option<V> {
         let node = self.node(node_id);
 
-        let (is_leaf, len) = unsafe { (*node.is_leaf.get(), *node.len.get()) };
+        // SAFETY: Caller holds write lock on this node.
+        let (is_leaf, len) = unsafe { (node.read_is_leaf(), node.read_len()) };
 
-        let keys_ptr = node.keys.get();
-        let search_result = unsafe {
-            let keys = &*keys_ptr;
-            keys[0..len].binary_search(&key)
-        };
+        let search_result = unsafe { node.binary_search_raw(&key, len) };
 
         if is_leaf {
             match search_result {
@@ -820,25 +1148,26 @@ where
     fn ensure_child_can_lose_key(&self, parent_id: NodeId, child_idx: usize) -> NodeId {
         let parent = self.node(parent_id);
 
-        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
+        // SAFETY: Caller holds write lock on parent.
+        let child_id = unsafe { parent.read_child(child_idx).expect("child must exist") };
         let child = self.node(child_id);
         child.write_lock();
 
-        let child_len = unsafe { *child.len.get() };
+        let child_len = unsafe { child.read_len() };
 
         if child_len > CAP / 2 {
             child.write_unlock();
             return child_id;
         }
 
-        let parent_len = unsafe { *parent.len.get() };
+        let parent_len = unsafe { parent.read_len() };
 
         if child_idx > 0 {
-            let left_id = unsafe { (*parent.children.get())[child_idx - 1].expect("left sibling must exist") };
+            let left_id = unsafe { parent.read_child(child_idx - 1).expect("left sibling must exist") };
             let left = self.node(left_id);
             left.write_lock();
 
-            let left_len = unsafe { *left.len.get() };
+            let left_len = unsafe { left.read_len() };
             if left_len > CAP / 2 {
                 self.borrow_from_left(parent_id, child_idx);
                 left.write_unlock();
@@ -853,11 +1182,11 @@ where
         }
 
         if child_idx < parent_len {
-            let right_id = unsafe { (*parent.children.get())[child_idx + 1].expect("right sibling must exist") };
+            let right_id = unsafe { parent.read_child(child_idx + 1).expect("right sibling must exist") };
             let right = self.node(right_id);
             right.write_lock();
 
-            let right_len = unsafe { *right.len.get() };
+            let right_len = unsafe { right.read_len() };
             if right_len > CAP / 2 {
                 self.borrow_from_right(parent_id, child_idx);
                 right.write_unlock();
@@ -877,130 +1206,108 @@ where
 
     fn borrow_from_left(&self, parent_id: NodeId, child_idx: usize) {
         let parent = self.node(parent_id);
-        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
-        let left_id = unsafe { (*parent.children.get())[child_idx - 1].expect("left sibling must exist") };
+        // SAFETY: Caller holds write locks on parent, child, and left sibling.
+        let child_id = unsafe { parent.read_child(child_idx).expect("child must exist") };
+        let left_id = unsafe { parent.read_child(child_idx - 1).expect("left sibling must exist") };
 
         let child = self.node(child_id);
         let left = self.node(left_id);
 
+        // SAFETY: We hold write locks on all three nodes.
         unsafe {
-            let p_keys = &mut *parent.keys.get();
-            let p_vals = &mut *parent.values.get();
+            let c_len = child.read_len();
+            let l_len = left.read_len();
+            let is_internal = !child.read_is_leaf();
 
-            let c_keys = &mut *child.keys.get();
-            let c_vals = &mut *child.values.get();
-            let c_children = &mut *child.children.get();
-            let c_len = *child.len.get();
-
-            let l_keys = &mut *left.keys.get();
-            let l_vals = &mut *left.values.get();
-            let l_children = &mut *left.children.get();
-            let l_len = *left.len.get();
-
-            c_keys.copy_within(0..c_len, 1);
-            c_vals.copy_within(0..c_len, 1);
-            if !*child.is_leaf.get() {
-                c_children.copy_within(0..=c_len, 1);
+            child.shift_keys_right(0, c_len);
+            child.shift_values_right(0, c_len);
+            if is_internal {
+                child.shift_children_right(0, c_len + 1);
             }
 
-            c_keys[0] = p_keys[child_idx - 1];
-            c_vals[0] = p_vals[child_idx - 1];
+            child.write_key(0, parent.read_key(child_idx - 1));
+            child.write_value(0, parent.read_value(child_idx - 1));
 
-            p_keys[child_idx - 1] = l_keys[l_len - 1];
-            p_vals[child_idx - 1] = l_vals[l_len - 1];
+            parent.write_key(child_idx - 1, left.read_key(l_len - 1));
+            parent.write_value(child_idx - 1, left.read_value(l_len - 1));
 
-            if !*child.is_leaf.get() {
-                c_children[0] = l_children[l_len];
+            if is_internal {
+                child.write_child(0, left.read_child(l_len));
             }
 
-            *child.len.get() += 1;
-            *left.len.get() -= 1;
+            child.write_len(c_len + 1);
+            left.write_len(l_len - 1);
         }
     }
 
     fn borrow_from_right(&self, parent_id: NodeId, child_idx: usize) {
         let parent = self.node(parent_id);
-        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
-        let right_id = unsafe { (*parent.children.get())[child_idx + 1].expect("right sibling must exist") };
+        // SAFETY: Caller holds write locks on parent, child, and right sibling.
+        let child_id = unsafe { parent.read_child(child_idx).expect("child must exist") };
+        let right_id = unsafe { parent.read_child(child_idx + 1).expect("right sibling must exist") };
 
         let child = self.node(child_id);
         let right = self.node(right_id);
 
+        // SAFETY: We hold write locks on all three nodes.
         unsafe {
-            let p_keys = &mut *parent.keys.get();
-            let p_vals = &mut *parent.values.get();
+            let c_len = child.read_len();
+            let r_len = right.read_len();
+            let is_internal = !child.read_is_leaf();
 
-            let c_keys = &mut *child.keys.get();
-            let c_vals = &mut *child.values.get();
-            let c_children = &mut *child.children.get();
-            let c_len = *child.len.get();
+            child.write_key(c_len, parent.read_key(child_idx));
+            child.write_value(c_len, parent.read_value(child_idx));
 
-            let r_keys = &mut *right.keys.get();
-            let r_vals = &mut *right.values.get();
-            let r_children = &mut *right.children.get();
-            let r_len = *right.len.get();
-
-            c_keys[c_len] = p_keys[child_idx];
-            c_vals[c_len] = p_vals[child_idx];
-
-            if !*child.is_leaf.get() {
-                c_children[c_len + 1] = r_children[0];
+            if is_internal {
+                child.write_child(c_len + 1, right.read_child(0));
             }
 
-            p_keys[child_idx] = r_keys[0];
-            p_vals[child_idx] = r_vals[0];
+            parent.write_key(child_idx, right.read_key(0));
+            parent.write_value(child_idx, right.read_value(0));
 
-            r_keys.copy_within(1..r_len, 0);
-            r_vals.copy_within(1..r_len, 0);
-            if !*child.is_leaf.get() {
-                r_children.copy_within(1..=r_len, 0);
+            right.shift_keys_left(0, r_len - 1);
+            right.shift_values_left(0, r_len - 1);
+            if is_internal {
+                right.shift_children_left(0, r_len);
             }
 
-            *child.len.get() += 1;
-            *right.len.get() -= 1;
+            child.write_len(c_len + 1);
+            right.write_len(r_len - 1);
         }
     }
 
     fn merge_with_left(&self, parent_id: NodeId, child_idx: usize) -> NodeId {
         let parent = self.node(parent_id);
-        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
-        let left_id = unsafe { (*parent.children.get())[child_idx - 1].expect("left sibling must exist") };
+        // SAFETY: Caller holds write locks on parent, child, and left sibling.
+        let child_id = unsafe { parent.read_child(child_idx).expect("child must exist") };
+        let left_id = unsafe { parent.read_child(child_idx - 1).expect("left sibling must exist") };
 
         let child = self.node(child_id);
         let left = self.node(left_id);
 
+        // SAFETY: We hold write locks on all three nodes.
         unsafe {
-            let p_keys = &mut *parent.keys.get();
-            let p_vals = &mut *parent.values.get();
-            let p_children = &mut *parent.children.get();
-            let p_len = *parent.len.get();
+            let p_len = parent.read_len();
+            let c_len = child.read_len();
+            let l_len = left.read_len();
+            let is_internal = !child.read_is_leaf();
 
-            let c_keys = &*child.keys.get();
-            let c_vals = &*child.values.get();
-            let c_children = &*child.children.get();
-            let c_len = *child.len.get();
+            left.write_key(l_len, parent.read_key(child_idx - 1));
+            left.write_value(l_len, parent.read_value(child_idx - 1));
 
-            let l_keys = &mut *left.keys.get();
-            let l_vals = &mut *left.values.get();
-            let l_children = &mut *left.children.get();
-            let l_len = *left.len.get();
+            left.copy_keys_from(l_len + 1, child, 0, c_len);
+            left.copy_values_from(l_len + 1, child, 0, c_len);
 
-            l_keys[l_len] = p_keys[child_idx - 1];
-            l_vals[l_len] = p_vals[child_idx - 1];
-
-            l_keys[l_len + 1..l_len + 1 + c_len].copy_from_slice(&c_keys[0..c_len]);
-            l_vals[l_len + 1..l_len + 1 + c_len].copy_from_slice(&c_vals[0..c_len]);
-
-            if !*child.is_leaf.get() {
-                l_children[l_len + 1..l_len + 2 + c_len].copy_from_slice(&c_children[0..=c_len]);
+            if is_internal {
+                left.copy_children_from(l_len + 1, child, 0, c_len + 1);
             }
 
-            *left.len.get() = l_len + 1 + c_len;
+            left.write_len(l_len + 1 + c_len);
 
-            p_keys.copy_within(child_idx..p_len, child_idx - 1);
-            p_vals.copy_within(child_idx..p_len, child_idx - 1);
-            p_children.copy_within(child_idx + 1..=p_len, child_idx);
-            *parent.len.get() -= 1;
+            parent.shift_keys_left(child_idx - 1, p_len - child_idx);
+            parent.shift_values_left(child_idx - 1, p_len - child_idx);
+            parent.shift_children_left(child_idx, p_len - child_idx);
+            parent.write_len(p_len - 1);
         }
 
         left_id
@@ -1008,44 +1315,36 @@ where
 
     fn merge_with_right(&self, parent_id: NodeId, child_idx: usize) -> NodeId {
         let parent = self.node(parent_id);
-        let child_id = unsafe { (*parent.children.get())[child_idx].expect("child must exist") };
-        let right_id = unsafe { (*parent.children.get())[child_idx + 1].expect("right sibling must exist") };
+        // SAFETY: Caller holds write locks on parent, child, and right sibling.
+        let child_id = unsafe { parent.read_child(child_idx).expect("child must exist") };
+        let right_id = unsafe { parent.read_child(child_idx + 1).expect("right sibling must exist") };
 
         let child = self.node(child_id);
         let right = self.node(right_id);
 
+        // SAFETY: We hold write locks on all three nodes.
         unsafe {
-            let p_keys = &mut *parent.keys.get();
-            let p_vals = &mut *parent.values.get();
-            let p_children = &mut *parent.children.get();
-            let p_len = *parent.len.get();
+            let p_len = parent.read_len();
+            let c_len = child.read_len();
+            let r_len = right.read_len();
+            let is_internal = !child.read_is_leaf();
 
-            let c_keys = &mut *child.keys.get();
-            let c_vals = &mut *child.values.get();
-            let c_children = &mut *child.children.get();
-            let c_len = *child.len.get();
+            child.write_key(c_len, parent.read_key(child_idx));
+            child.write_value(c_len, parent.read_value(child_idx));
 
-            let r_keys = &*right.keys.get();
-            let r_vals = &*right.values.get();
-            let r_children = &*right.children.get();
-            let r_len = *right.len.get();
+            child.copy_keys_from(c_len + 1, right, 0, r_len);
+            child.copy_values_from(c_len + 1, right, 0, r_len);
 
-            c_keys[c_len] = p_keys[child_idx];
-            c_vals[c_len] = p_vals[child_idx];
-
-            c_keys[c_len + 1..c_len + 1 + r_len].copy_from_slice(&r_keys[0..r_len]);
-            c_vals[c_len + 1..c_len + 1 + r_len].copy_from_slice(&r_vals[0..r_len]);
-
-            if !*child.is_leaf.get() {
-                c_children[c_len + 1..c_len + 2 + r_len].copy_from_slice(&r_children[0..=r_len]);
+            if is_internal {
+                child.copy_children_from(c_len + 1, right, 0, r_len + 1);
             }
 
-            *child.len.get() = c_len + 1 + r_len;
+            child.write_len(c_len + 1 + r_len);
 
-            p_keys.copy_within(child_idx + 1..p_len, child_idx);
-            p_vals.copy_within(child_idx + 1..p_len, child_idx);
-            p_children.copy_within(child_idx + 2..=p_len, child_idx + 1);
-            *parent.len.get() -= 1;
+            parent.shift_keys_left(child_idx, p_len - child_idx - 1);
+            parent.shift_values_left(child_idx, p_len - child_idx - 1);
+            parent.shift_children_left(child_idx + 1, p_len - child_idx - 1);
+            parent.write_len(p_len - 1);
         }
 
         child_id
@@ -1054,23 +1353,24 @@ where
     fn remove_from_internal(&self, node_id: NodeId, idx: usize, key: K) -> V {
         let node = self.node(node_id);
 
-        let old_value = unsafe { (*node.values.get())[idx] };
+        // SAFETY: Caller holds write lock on node.
+        let old_value = unsafe { node.read_value(idx) };
 
         let left_child_id = self.ensure_child_can_lose_key(node_id, idx);
 
-        let current_len = unsafe { *node.len.get() };
+        let current_len = unsafe { node.read_len() };
 
         let key_still_here = unsafe {
-            let keys = &*node.keys.get();
-            idx < current_len && keys[idx] == key
+            idx < current_len && node.read_key(idx) == key
         };
 
         if key_still_here {
             let (pred_key, pred_val) = self.delete_max_from_subtree(left_child_id);
 
+            // SAFETY: We hold write lock on node.
             unsafe {
-                (*node.keys.get())[idx] = pred_key;
-                (*node.values.get())[idx] = pred_val;
+                node.write_key(idx, pred_key);
+                node.write_value(idx, pred_val);
             }
         } else {
             let child = self.node(left_child_id);
@@ -1086,20 +1386,19 @@ where
         let node = self.node(node_id);
         node.write_lock();
 
-        let is_leaf = unsafe { *node.is_leaf.get() };
+        // SAFETY: We hold the write lock.
+        let is_leaf = unsafe { node.read_is_leaf() };
 
         if is_leaf {
-            let len = unsafe { *node.len.get() };
+            let len = unsafe { node.read_len() };
             let result = unsafe {
-                let keys = &*node.keys.get();
-                let vals = &*node.values.get();
-                (keys[len - 1], vals[len - 1])
+                (node.read_key(len - 1), node.read_value(len - 1))
             };
-            unsafe { *node.len.get() -= 1 };
+            unsafe { node.write_len(len - 1) };
             node.write_unlock();
             result
         } else {
-            let len = unsafe { *node.len.get() };
+            let len = unsafe { node.read_len() };
             let rightmost_idx = len;
 
             let child_id = self.ensure_child_can_lose_key(node_id, rightmost_idx);
@@ -1114,17 +1413,15 @@ where
     fn remove_from_leaf(&self, node_id: NodeId, idx: usize) -> V {
         let node = self.node(node_id);
 
+        // SAFETY: Caller holds write lock on node.
         unsafe {
-            let len = *node.len.get();
-            let keys = &mut *node.keys.get();
-            let vals = &mut *node.values.get();
+            let len = node.read_len();
+            let value = node.read_value(idx);
 
-            let value = vals[idx];
+            node.shift_keys_left(idx, len - idx - 1);
+            node.shift_values_left(idx, len - idx - 1);
 
-            keys.copy_within(idx + 1..len, idx);
-            vals.copy_within(idx + 1..len, idx);
-
-            *node.len.get() -= 1;
+            node.write_len(len - 1);
 
             value
         }
@@ -1145,20 +1442,26 @@ where
     fn print_subtree(&self, node_id: NodeId, depth: usize) {
         let node = self.node(node_id);
         let indent = "  ".repeat(depth);
+
+        // SAFETY: This is a debug function that performs unsynchronized reads.
+        // It should only be used when no concurrent mutations are occurring,
+        // or when the caller accepts that the output may be inconsistent.
+        // We use raw pointer reads to avoid creating references that could
+        // conflict with concurrent writers under Stacked Borrows.
         unsafe {
-            let keys_slice = &*node.keys.get();
-            let len = *node.len.get();
-            let is_leaf = *node.is_leaf.get();
+            let len = node.read_len();
+            let is_leaf = node.read_is_leaf();
+
+            let keys: Vec<K> = (0..len).map(|i| node.read_key(i)).collect();
+
             println!(
                 "{}Node[{}] (Leaf: {}) Keys: {:?}",
-                indent,
-                node_id.0,
-                is_leaf,
-                &keys_slice[0..len]
+                indent, node_id.0, is_leaf, keys
             );
+
             if !is_leaf {
-                for i in 0..=*node.len.get() {
-                    if let Some(child_id) = (*node.children.get())[i] {
+                for i in 0..=len {
+                    if let Some(child_id) = node.read_child(i) {
                         self.print_subtree(child_id, depth + 1);
                     }
                 }
