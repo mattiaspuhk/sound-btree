@@ -182,6 +182,70 @@ where
     }
 }
 
+pub struct NodeWriteGuard<'a, K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    node: &'a Node<K, V>,
+    released: bool,
+}
+
+impl<'a, K, V> NodeWriteGuard<'a, K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    #[inline]
+    fn new(node: &'a Node<K, V>) -> Self {
+        node.write_lock();
+        Self { node, released: false }
+    }
+
+    #[inline]
+    fn release(mut self) {
+        if !self.released {
+            self.node.write_unlock();
+            self.released = true;
+        }
+    }
+
+    #[inline]
+    fn node(&self) -> &'a Node<K, V> {
+        self.node
+    }
+
+    #[inline]
+    fn into_inner(mut self) -> &'a Node<K, V> {
+        self.released = true;
+        self.node
+    }
+}
+
+impl<K, V> Drop for NodeWriteGuard<'_, K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    fn drop(&mut self) {
+        if !self.released {
+            self.node.write_unlock();
+        }
+    }
+}
+
+impl<K, V> std::ops::Deref for NodeWriteGuard<'_, K, V>
+where
+    K: Copy + Ord + Default,
+    V: Copy + Default,
+{
+    type Target = Node<K, V>;
+
+    fn deref(&self) -> &Self::Target {
+        self.node
+    }
+}
+
 pub struct BTree<K, V>
 where
     K: Copy + Ord + Default,
