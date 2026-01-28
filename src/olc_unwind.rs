@@ -5,50 +5,12 @@
 //! This module implements Optimistic Lock Coupling retry via `panic_any(VersionMismatch)`
 //! and `catch_unwind`. When validation fails, we panic with a sentinel type, which unwinds
 //! the stack back to the `catch_unwind` handler in the public API.
-//!
-//! ## Trade-offs
-//!
-//! **Pros:**
-//! - Zero branches on the happy path - no `if err` checks at each stack frame
-//! - The validation failure is truly exceptional, so unwinding overhead is acceptable
-//! - CPU pipeline stays clean without branch misprediction overhead
-//!
-//! **Cons:**
-//! - Relies on DWARF exception tables (on most platforms) for unwinding
-//! - Unwinding is EXPENSIVE (~100-1000x slower than a normal return)
-//! - Requires `panic = "unwind"` (won't work with `panic = "abort"`)
-//! - Less idiomatic for Rust control flow
-//!
-//! ## Exception Safety
-//!
-//! This is safe because:
-//! 1. OLC readers don't hold any locks - they just read with version validation
-//! 2. Writers use RAII guards (NodeWriteGuard) that release locks on drop
-//! 3. The panic only happens in the read path before any writes
-//! 4. No mutexes are poisoned because we don't hold std::sync primitives
-//!
-//! ## CPU Mechanism: Why This Can Be Faster
-//!
-//! The happy path involves no conditional branches for error checking. Modern CPUs:
-//! - Have limited branch prediction resources
-//! - Suffer pipeline stalls on mispredicted branches
-//! - The Result approach adds N branches for N stack frames
-//! - The Unwind approach has 0 branches until unwinding begins
-//!
-//! However, when unwinding DOES happen, it's extremely slow because it must:
-//! - Walk the DWARF exception tables to find handlers
-//! - Run destructors for all stack frames
-//! - Perform personality routine lookups
-//!
-//! Net effect: Faster happy path, MUCH slower retry path.
 
 use std::cell::UnsafeCell;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any, resume_unwind};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::any::Any;
 
-/// Sentinel type for OLC validation failure.
-/// We use a distinct type so we can distinguish it from real panics.
 #[derive(Debug)]
 pub struct VersionMismatch;
 
@@ -110,8 +72,6 @@ where
         self.version.load(Ordering::Acquire)
     }
 
-    /// Validates version. PANICS with VersionMismatch on failure.
-    /// This is the key difference: no Result, just panic.
     #[inline]
     pub fn validate_or_panic(&self, start_version: u64) {
         std::sync::atomic::fence(Ordering::Acquire);
@@ -119,10 +79,8 @@ where
         if current != start_version || current % 2 != 0 {
             panic_any(VersionMismatch);
         }
-        // No branch on the happy path after this point!
     }
 
-    /// Check if version is even (unlocked). PANICS if locked.
     #[inline]
     pub fn check_unlocked_or_panic(&self, version: u64) {
         if version % 2 != 0 {
@@ -321,13 +279,11 @@ where
         self.node
     }
 }
-
-/// Check if a panic payload is our VersionMismatch sentinel.
+    
 fn is_version_mismatch(payload: &Box<dyn Any + Send>) -> bool {
     payload.is::<VersionMismatch>()
 }
 
-/// B-Tree using OLC with panic-based retry (stack unwinding).
 pub struct BTreeUnwind<K, V, const CAP: usize = DEFAULT_CAP, const CHILDREN_CAP: usize = DEFAULT_CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
@@ -435,16 +391,8 @@ where
         NodeId(idx as u32)
     }
 
-    /// Public search API using catch_unwind for retry.
-    ///
-    /// The catch_unwind boundary is the ONLY place where we handle retries.
-    /// This is the key architectural difference from the Result approach.
     pub fn search(&self, key: K) -> Option<V> {
         loop {
-            // AssertUnwindSafe is needed because &self might not be UnwindSafe
-            // (due to UnsafeCell). However, we know this is safe because:
-            // 1. We only read data, no mutations in the optimistic path
-            // 2. If we panic, no invariants are violated
             let result = catch_unwind(AssertUnwindSafe(|| {
                 self.search_inner(key)
             }));
@@ -453,10 +401,8 @@ where
                 Ok(value) => return value,
                 Err(payload) => {
                     if is_version_mismatch(&payload) {
-                        // Our sentinel - retry
                         continue;
                     } else {
-                        // Real panic - re-raise it
                         resume_unwind(payload);
                     }
                 }
@@ -464,12 +410,6 @@ where
         }
     }
 
-    /// Inner search that panics on version mismatch.
-    ///
-    /// Notice: NO error handling code in this function!
-    /// The validate_or_panic calls either succeed silently or unwind.
-    /// This means the CPU sees a straight-line code path with no branches
-    /// for error checking.
     #[inline]
     fn search_inner(&self, key: K) -> Option<V> {
         let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
@@ -478,7 +418,7 @@ where
             let node = self.node(current_id);
 
             let start_version = node.read_version();
-            node.check_unlocked_or_panic(start_version); // Panics if locked
+            node.check_unlocked_or_panic(start_version);
 
             let read_result = unsafe {
                 let len = node.read_len();
@@ -496,21 +436,20 @@ where
                 }
             };
 
-            node.validate_or_panic(start_version); // Panics if version changed
+            node.validate_or_panic(start_version);
 
             match read_result {
                 Ok(result) => return result,
                 Err(child_opt) => {
                     match child_opt {
                         Some(child_id) => current_id = child_id,
-                        None => panic_any(VersionMismatch), // Child was None
+                        None => panic_any(VersionMismatch),
                     }
                 }
             }
         }
     }
 
-    /// Public insert API using catch_unwind.
     pub fn insert(&self, key: K, value: V) {
         loop {
             let result = catch_unwind(AssertUnwindSafe(|| {
@@ -522,13 +461,12 @@ where
                     if success {
                         return;
                     }
-                    // success == false means we need pessimistic path
                     self.insert_pessimistic(key, value);
                     return;
                 }
                 Err(payload) => {
                     if is_version_mismatch(&payload) {
-                        continue; // Retry
+                        continue;
                     } else {
                         resume_unwind(payload);
                     }
@@ -537,8 +475,6 @@ where
         }
     }
 
-    /// Optimistic insert that panics on version mismatch.
-    /// Returns true if insert succeeded, false if we need pessimistic fallback.
     #[inline]
     fn insert_optimistic_inner(&self, key: K, value: V) -> bool {
         let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
@@ -584,7 +520,6 @@ where
 
                     let is_full = unsafe { guard.read_len() >= CAP };
                     if is_full {
-                        // Need pessimistic path - guard will unlock on drop
                         return false;
                     }
 
@@ -825,7 +760,6 @@ mod tests {
 
     #[test]
     fn test_exception_safety_no_lock_poisoning() {
-        // Verify that version mismatch panics don't poison any state
         use std::sync::Arc;
         use std::thread;
         use std::sync::atomic::AtomicUsize;
@@ -833,14 +767,12 @@ mod tests {
         let tree = Arc::new(BTreeUnwind::<u64, u64>::new());
         let success_count = Arc::new(AtomicUsize::new(0));
 
-        // Pre-populate
         for i in 0..100u64 {
             tree.insert(i, i);
         }
 
         let mut handles = vec![];
 
-        // Readers that will cause many version mismatches
         for _ in 0..4 {
             let tree_ref = tree.clone();
             let count_ref = success_count.clone();
@@ -852,7 +784,6 @@ mod tests {
             }));
         }
 
-        // Writers that cause the mismatches
         for t in 0..2 {
             let tree_ref = tree.clone();
             handles.push(thread::spawn(move || {
@@ -866,7 +797,6 @@ mod tests {
             h.join().unwrap();
         }
 
-        // All operations completed without deadlock or poisoned state
         assert!(success_count.load(Ordering::Relaxed) > 0);
     }
 }

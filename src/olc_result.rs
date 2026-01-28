@@ -5,24 +5,10 @@
 //! This module implements Optimistic Lock Coupling retry via `Result<T, VersionMismatch>`.
 //! When validation fails, we return `Err(VersionMismatch)` and propagate it up the call
 //! stack using the `?` operator. The public API catches this at the top level and loops.
-//!
-//! ## Trade-offs
-//!
-//! **Pros:**
-//! - Idiomatic Rust error handling
-//! - Zero runtime overhead for the error path setup (no DWARF tables needed)
-//! - Plays nicely with `#[must_use]` and other Rust safety features
-//!
-//! **Cons:**
-//! - Adds a branch (`if err`) at every return point in the call stack
-//! - On the happy path, the CPU must predict and execute these branches
-//! - Can cause pipeline stalls if branch prediction fails
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-/// Sentinel error indicating OLC validation failed.
-/// This is a zero-size type for minimal overhead.
 #[derive(Debug, Clone, Copy)]
 pub struct VersionMismatch;
 
@@ -84,9 +70,6 @@ where
         self.version.load(Ordering::Acquire)
     }
 
-    /// Validates version and returns `Err(VersionMismatch)` on failure.
-    /// This is the key difference from the original: instead of returning bool,
-    /// we return Result so callers can use `?` to propagate.
     #[inline]
     pub fn validate(&self, start_version: u64) -> Result<(), VersionMismatch> {
         std::sync::atomic::fence(Ordering::Acquire);
@@ -98,7 +81,6 @@ where
         }
     }
 
-    /// Check if version is even (unlocked). Returns `Err(VersionMismatch)` if locked.
     #[inline]
     pub fn check_unlocked(&self, version: u64) -> Result<(), VersionMismatch> {
         if version % 2 == 0 {
@@ -299,7 +281,6 @@ where
     }
 }
 
-/// B-Tree using OLC with Result-based retry propagation.
 pub struct BTreeResult<K, V, const CAP: usize = DEFAULT_CAP, const CHILDREN_CAP: usize = DEFAULT_CHILDREN_CAP>
 where
     K: Copy + Ord + Default,
@@ -523,7 +504,6 @@ where
 
                     let is_full = unsafe { guard.read_len() >= CAP };
                     if is_full {
-                        // Fall back to pessimistic path
                         drop(guard);
                         self.insert_pessimistic(key, value);
                         return Ok(true);
