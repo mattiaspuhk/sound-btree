@@ -324,14 +324,10 @@ where
     const DEFAULT_NODE_CAPACITY: usize = 10_000;
 
     pub fn new() -> Self {
-        Self::with_node_capacity(Self::DEFAULT_NODE_CAPACITY)
+        Self::with_capacity(Self::DEFAULT_NODE_CAPACITY)
     }
 
     pub fn with_capacity(max_nodes: usize) -> Self {
-        Self::with_node_capacity(max_nodes)
-    }
-
-    pub fn with_node_capacity(max_nodes: usize) -> Self {
         assert!(max_nodes >= 1, "Arena must have at least 1 node");
 
         let mut pages = Vec::with_capacity(max_nodes);
