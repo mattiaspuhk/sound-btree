@@ -249,6 +249,7 @@ where
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn release(mut self) {
         if !self.released {
             self.node.write_unlock();
