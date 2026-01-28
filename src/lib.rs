@@ -630,7 +630,6 @@ where
             let node = self.node(current_id);
             let start_version = node.read_version();
 
-            // Must be even (unlocked) to read
             if start_version % 2 != 0 {
                 return None;
             }
@@ -648,7 +647,6 @@ where
                 } else {
                     match keys[0..len].binary_search(&key) {
                         Ok(_) => {
-                            // Key is in internal node - need pessimistic path
                             return None;
                         }
                         Err(idx) => Ok((*node.children.get())[idx]),
@@ -666,15 +664,12 @@ where
                 Err(Some(idx)) => {
                     node.write_lock();
 
-                    // Re-check conditions under lock
                     let can_delete = unsafe {
                         let len = *node.len.get();
                         let is_leaf = *node.is_leaf.get();
                         let keys = &*node.keys.get();
                         let is_root = current_id.0 == self.root_id.load(Ordering::Relaxed);
 
-                        // Can delete if: still a leaf, key at same position,
-                        // and (has enough keys OR is root)
                         is_leaf
                             && (len > MIN_KEYS || is_root)
                             && matches!(keys[0..len].binary_search(&key), Ok(found_idx) if found_idx == idx)
