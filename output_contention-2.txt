@@ -1,0 +1,186 @@
+OLC Single Thread Search (Happy Path)/Original
+                        time:   [27.673 µs 27.881 µs 28.077 µs]
+                        thrpt:  [35.616 Melem/s 35.867 Melem/s 36.136 Melem/s]
+                 change:
+                        time:   [+2.1549% +2.8525% +3.5696%] (p = 0.00 < 0.05)
+                        thrpt:  [-3.4465% -2.7733% -2.1095%]
+                        Performance has regressed.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+OLC Single Thread Search (Happy Path)/Result
+                        time:   [35.758 µs 35.828 µs 35.917 µs]
+                        thrpt:  [27.842 Melem/s 27.911 Melem/s 27.966 Melem/s]
+                 change:
+                        time:   [-0.5146% -0.0112% +0.5179%] (p = 0.98 > 0.05)
+                        thrpt:  [-0.5152% +0.0112% +0.5173%]
+                        No change in performance detected.
+Found 15 outliers among 100 measurements (15.00%)
+  1 (1.00%) high mild
+  14 (14.00%) high severe
+OLC Single Thread Search (Happy Path)/Unwind
+                        time:   [28.773 µs 28.828 µs 28.891 µs]
+                        thrpt:  [34.612 Melem/s 34.689 Melem/s 34.755 Melem/s]
+                 change:
+                        time:   [-1.7172% -1.2219% -0.7469%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.7526% +1.2370% +1.7472%]
+                        Change within noise threshold.
+Found 12 outliers among 100 measurements (12.00%)
+  3 (3.00%) high mild
+  9 (9.00%) high severe
+
+OLC Read-Heavy (95% reads)/Original
+                        time:   [141.34 µs 142.87 µs 144.64 µs]
+                        thrpt:  [11.062 Melem/s 11.199 Melem/s 11.320 Melem/s]
+                 change:
+                        time:   [+0.6801% +2.8839% +5.4708%] (p = 0.02 < 0.05)
+                        thrpt:  [-5.1870% -2.8030% -0.6755%]
+                        Change within noise threshold.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+OLC Read-Heavy (95% reads)/Result
+                        time:   [141.18 µs 142.07 µs 142.97 µs]
+                        thrpt:  [11.191 Melem/s 11.262 Melem/s 11.333 Melem/s]
+                 change:
+                        time:   [+0.0365% +1.3990% +2.6890%] (p = 0.05 < 0.05)
+                        thrpt:  [-2.6186% -1.3797% -0.0365%]
+                        Change within noise threshold.
+OLC Read-Heavy (95% reads)/Unwind
+                        time:   [165.26 µs 167.41 µs 169.26 µs]
+                        thrpt:  [9.4529 Melem/s 9.5576 Melem/s 9.6820 Melem/s]
+                 change:
+                        time:   [-0.5858% +0.9929% +2.5035%] (p = 0.25 > 0.05)
+                        thrpt:  [-2.4424% -0.9832% +0.5892%]
+                        No change in performance detected.
+Criterion.rs ERROR: Error in Gnuplot:          line 0: Bad format character
+
+
+
+OLC High Contention/Original/extreme
+                        time:   [136.46 µs 137.04 µs 137.59 µs]
+                        thrpt:  [5.8142 Melem/s 5.8379 Melem/s 5.8625 Melem/s]
+                 change:
+                        time:   [-1.0276% +0.8384% +2.7492%] (p = 0.40 > 0.05)
+                        thrpt:  [-2.6757% -0.8314% +1.0382%]
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high severe
+OLC High Contention/Result/extreme
+                        time:   [137.58 µs 138.61 µs 139.78 µs]
+                        thrpt:  [5.7233 Melem/s 5.7718 Melem/s 5.8147 Melem/s]
+                 change:
+                        time:   [+0.8191% +2.3512% +4.0281%] (p = 0.01 < 0.05)
+                        thrpt:  [-3.8721% -2.2972% -0.8125%]
+                        Change within noise threshold.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+OLC High Contention/Unwind/extreme
+                        time:   [134.14 µs 135.56 µs 136.88 µs]
+                        thrpt:  [5.8447 Melem/s 5.9016 Melem/s 5.9638 Melem/s]
+                 change:
+                        time:   [-0.6978% +0.8740% +2.4951%] (p = 0.31 > 0.05)
+                        thrpt:  [-2.4344% -0.8664% +0.7027%]
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+OLC High Contention/Original/high
+                        time:   [132.57 µs 133.45 µs 134.50 µs]
+                        thrpt:  [5.9480 Melem/s 5.9949 Melem/s 6.0344 Melem/s]
+                 change:
+                        time:   [+1.1089% +3.4538% +6.7890%] (p = 0.01 < 0.05)
+                        thrpt:  [-6.3574% -3.3385% -1.0968%]
+                        Performance has regressed.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high severe
+OLC High Contention/Result/high
+                        time:   [131.97 µs 132.46 µs 132.91 µs]
+                        thrpt:  [6.0191 Melem/s 6.0394 Melem/s 6.0622 Melem/s]
+                 change:
+                        time:   [-1.2965% -0.2781% +0.7294%] (p = 0.62 > 0.05)
+                        thrpt:  [-0.7241% +0.2789% +1.3135%]
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high mild
+OLC High Contention/Unwind/high
+                        time:   [133.63 µs 134.60 µs 135.71 µs]
+                        thrpt:  [5.8950 Melem/s 5.9434 Melem/s 5.9865 Melem/s]
+                 change:
+                        time:   [-0.7501% +0.6447% +2.0102%] (p = 0.38 > 0.05)
+                        thrpt:  [-1.9706% -0.6405% +0.7557%]
+                        No change in performance detected.
+OLC High Contention/Original/medium
+                        time:   [85.306 µs 85.640 µs 86.033 µs]
+                        thrpt:  [4.6494 Melem/s 4.6707 Melem/s 4.6890 Melem/s]
+                 change:
+                        time:   [+1.0779% +2.1043% +3.2814%] (p = 0.00 < 0.05)
+                        thrpt:  [-3.1772% -2.0609% -1.0664%]
+                        Performance has regressed.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+OLC High Contention/Result/medium
+                        time:   [85.658 µs 85.928 µs 86.336 µs]
+                        thrpt:  [4.6331 Melem/s 4.6551 Melem/s 4.6697 Melem/s]
+                 change:
+                        time:   [+0.5803% +2.9086% +5.9952%] (p = 0.03 < 0.05)
+                        thrpt:  [-5.6561% -2.8264% -0.5770%]
+                        Change within noise threshold.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high severe
+OLC High Contention/Unwind/medium
+                        time:   [85.397 µs 86.024 µs 86.875 µs]
+                        thrpt:  [4.6043 Melem/s 4.6498 Melem/s 4.6840 Melem/s]
+                 change:
+                        time:   [-3.8244% -1.1699% +1.0711%] (p = 0.41 > 0.05)
+                        thrpt:  [-1.0597% +1.1838% +3.9765%]
+                        No change in performance detected.
+Found 3 outliers among 20 measurements (15.00%)
+  3 (15.00%) high mild
+OLC High Contention/Original/low
+                        time:   [87.984 µs 88.550 µs 89.042 µs]
+                        thrpt:  [4.4923 Melem/s 4.5172 Melem/s 4.5463 Melem/s]
+                 change:
+                        time:   [-0.4684% +1.9949% +5.4609%] (p = 0.20 > 0.05)
+                        thrpt:  [-5.1781% -1.9559% +0.4706%]
+                        No change in performance detected.
+Found 3 outliers among 20 measurements (15.00%)
+  1 (5.00%) low mild
+  2 (10.00%) high severe
+OLC High Contention/Result/low
+                        time:   [87.557 µs 88.115 µs 88.558 µs]
+                        thrpt:  [4.5168 Melem/s 4.5395 Melem/s 4.5684 Melem/s]
+                 change:
+                        time:   [-0.9932% +1.2871% +4.0162%] (p = 0.36 > 0.05)
+                        thrpt:  [-3.8611% -1.2707% +1.0031%]
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high severe
+OLC High Contention/Unwind/low
+                        time:   [87.740 µs 88.661 µs 89.648 µs]
+                        thrpt:  [4.4619 Melem/s 4.5116 Melem/s 4.5589 Melem/s]
+                 change:
+                        time:   [+0.3343% +1.7145% +2.9770%] (p = 0.01 < 0.05)
+                        thrpt:  [-2.8910% -1.6856% -0.3331%]
+                        Change within noise threshold.
+Found 3 outliers among 20 measurements (15.00%)
+  1 (5.00%) low mild
+  2 (10.00%) high mild
+
+ Performance counter stats for 'target/release/deps/contention-6f27343f495a6eea --bench':
+
+ 1.508.547.070.244      cpu_atom/cycles/                                                        (66,59%)
+ 1.291.797.152.409      cpu_core/cycles/                                                        (82,34%)
+ 1.341.972.892.889      cpu_atom/instructions/           #    0,89  insn per cycle              (66,59%)
+ 1.758.833.185.687      cpu_core/instructions/           #    1,17  insn per cycle              (82,34%)
+   246.988.236.503      cpu_atom/branches/                                                      (66,59%)
+   315.363.049.607      cpu_core/branches/                                                      (82,34%)
+     7.379.505.071      cpu_atom/branch-misses/          #    2,99% of all branches             (66,59%)
+     5.724.145.000      cpu_core/branch-misses/          #    2,32% of all branches             (82,34%)
+   312.177.013.535      cpu_atom/L1-dcache-loads/                                               (66,59%)
+   451.342.919.223      cpu_core/L1-dcache-loads/                                               (82,34%)
+   <not supported>      cpu_atom/L1-dcache-load-misses/                                       
+    13.154.832.996      cpu_core/L1-dcache-load-misses/  #    4,21% of all L1-dcache accesses   (82,34%)
+
+     184,611855974 seconds time elapsed
+
+     169,264514000 seconds user
+     203,917912000 seconds sys

@@ -159,6 +159,7 @@ where
     }
 
     pub fn search(&self, key: K) -> Option<V> {
+
         'restart: loop {
             let mut current_id = NodeId(self.root_id.load(Ordering::Acquire));
 

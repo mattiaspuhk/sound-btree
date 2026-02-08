@@ -1,20 +1,3 @@
-//! High-Contention Benchmark: Result vs Unwind OLC Retry Strategies
-//! ## What We're Measuring
-//!
-//! 1. **Happy Path Performance**: When no conflicts occur, how much overhead does
-//!    each approach add? (The `?` branches vs clean code path)
-//!
-//! 2. **Retry Path Performance**: When conflicts DO occur, how expensive is each
-//!    retry mechanism? (Result return vs stack unwinding)
-//!
-//! 3. **Mixed Workload**: Realistic mix of reads and writes under contention.
-//!
-//! ## Expected Results
-//!
-//! - **Low contention**: Both approaches similar, slight edge to Unwind (fewer branches)
-//! - **High contention**: Result wins because unwinding is ~100-1000x slower than return
-//! - **Very high contention**: The retry overhead dominates, Result significantly faster
-
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };

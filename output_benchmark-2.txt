@@ -1,0 +1,89 @@
+Random Insertion/SoundBTree
+                        time:   [87.177 µs 88.575 µs 89.768 µs]
+                        change: [-9.4240% -6.1088% -2.3515%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  4 (4.00%) low severe
+  1 (1.00%) low mild
+Random Insertion/StdBTreeMap
+                        time:   [28.508 µs 28.536 µs 28.569 µs]
+                        change: [-0.9057% -0.5068% -0.1092%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+Found 13 outliers among 100 measurements (13.00%)
+  2 (2.00%) low mild
+  4 (4.00%) high mild
+  7 (7.00%) high severe
+
+Search Operations/SoundBTree
+                        time:   [648.11 µs 649.02 µs 649.92 µs]
+                        change: [-0.2716% +0.0959% +0.4722%] (p = 0.61 > 0.05)
+                        No change in performance detected.
+Found 11 outliers among 100 measurements (11.00%)
+  4 (4.00%) high mild
+  7 (7.00%) high severe
+Search Operations/StdBTreeMap
+                        time:   [430.08 µs 430.66 µs 431.32 µs]
+                        change: [-0.5661% -0.2204% +0.1184%] (p = 0.25 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  3 (3.00%) high mild
+  7 (7.00%) high severe
+
+Incremental Insert (into existing tree)/SoundBTree
+                        time:   [108.46 µs 110.03 µs 111.39 µs]
+                        change: [-15.154% -7.6677% +1.3147%] (p = 0.09 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  10 (10.00%) low severe
+Incremental Insert (into existing tree)/StdBTreeMap
+                        time:   [16.063 µs 16.109 µs 16.165 µs]
+                        change: [-44.760% -3.3481% +67.961%] (p = 0.85 > 0.05)
+                        No change in performance detected.
+Found 11 outliers among 100 measurements (11.00%)
+  3 (3.00%) high mild
+  8 (8.00%) high severe
+
+Delete Operations/SoundBTree
+                        time:   [87.431 µs 88.398 µs 89.198 µs]
+                        change: [-8.1189% -1.3367% +6.5304%] (p = 0.71 > 0.05)
+                        No change in performance detected.
+Found 20 outliers among 100 measurements (20.00%)
+  20 (20.00%) low severe
+Delete Operations/StdBTreeMap
+                        time:   [11.319 µs 11.343 µs 11.370 µs]
+                        change: [-0.6649% -0.2481% +0.2316%] (p = 0.30 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  2 (2.00%) low mild
+  4 (4.00%) high mild
+  1 (1.00%) high severe
+
+Mixed Operations (insert/search/delete)/SoundBTree
+                        time:   [170.82 µs 172.73 µs 174.32 µs]
+                        change: [-3.7705% -0.3826% +3.3699%] (p = 0.83 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) low mild
+Mixed Operations (insert/search/delete)/StdBTreeMap
+                        time:   [75.774 µs 75.966 µs 76.208 µs]
+                        change: [-14.491% +7.3333% +36.524%] (p = 0.67 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  8 (8.00%) high mild
+  2 (2.00%) high severe
+
+ Performance counter stats for 'target/release/deps/benchmark-6ae4aaacce43a027 --bench':
+
+   620.864.892.361      cpu_atom/cycles/                                                        (13,48%)
+   857.637.722.959      cpu_core/cycles/                                                        (87,15%)
+   855.887.103.542      cpu_atom/instructions/           #    1,38  insn per cycle              (13,48%)
+ 1.454.145.540.805      cpu_core/instructions/           #    2,34  insn per cycle              (87,15%)
+   142.959.455.300      cpu_atom/branches/                                                      (13,48%)
+   271.544.341.778      cpu_core/branches/                                                      (87,15%)
+     3.862.794.454      cpu_atom/branch-misses/          #    2,70% of all branches             (13,48%)
+     7.095.576.521      cpu_core/branch-misses/          #    4,96% of all branches             (87,15%)
+
+     106,837244266 seconds time elapsed
+
+     135,485079000 seconds user
+      34,262177000 seconds sys
